@@ -116,8 +116,54 @@ public struct ReplayOptions: Sendable {
     /// Debug affordance — see `MaskingPreviewView`.
     public var showMaskingPreview: Bool = false
 
-    /// Where segments are written. Defaults to `<caches>/maple-replay/<session-id>/`.
+    // MARK: Transport
+
+    /// Public ingest key — `maple_pk_…`.
+    ///
+    /// Required: `start()` refuses to record without a well-formed one rather than
+    /// spending a user's battery on a session it can never deliver. See
+    /// `IngestKeyProblem`.
+    ///
+    /// Use the **public** key. A private `maple_sk_` key authenticates too, but has no
+    /// business inside an app binary, where anyone can read it back out.
+    public var ingestKey: String?
+
+    /// Ingest base URL. Defaults to the host the browser SDK uses.
+    public var endpoint: URL = URL(string: "https://ingest.maple.dev")!
+
+    /// Also write each segment to `outputDirectory` — `segment-NNN.json.gz`, the
+    /// inspectable MP4 beside it, and `meta.ndjson`.
+    ///
+    /// Off by default: upload needs none of it. It stays because reading the exact bytes
+    /// that went over the wire, and watching the video to check redaction, is how this
+    /// gets debugged.
+    public var writeSegmentsToDisk: Bool = false
+
+    /// Where segments are written when `writeSegmentsToDisk` is on, and the parent of the
+    /// crash-recovery spool. Defaults to `<caches>/maple-replay/`.
     public var outputDirectory: URL?
+
+    // MARK: Crash recovery
+
+    /// Spool each captured frame to disk so the in-flight window survives a crash, and
+    /// recover any unfinished session at the next `start()`.
+    ///
+    /// On by default. In `.buffered` mode the buffer *is* the recording until something
+    /// calls `flush(trigger:)`, and a crash calls nothing — without this, the 30 seconds
+    /// before a crash, the recording most worth having, is the one recording that is
+    /// guaranteed to be lost.
+    public var crashRecovery: Bool = true
+
+    /// Ceiling on one session's spooled frames. Eviction normally happens on the ring
+    /// buffer's frame capacity; this bounds the pathological case where frames are far
+    /// larger than the tier suggests.
+    public var maxSpoolBytes: Int = 16 * 1024 * 1024
+
+    /// Ceiling on *all* spool directories together, applied at launch before recovery.
+    ///
+    /// The bound that matters: a crash loop leaves a fresh spool on every launch, so a
+    /// per-session limit alone would let a device fill up one crash at a time.
+    public var maxTotalSpoolBytes: Int = 48 * 1024 * 1024
 
     public init() {}
 }

@@ -99,6 +99,28 @@ public struct SessionMetaRow {
         return data
     }
 
+    /// Append this row to `meta.ndjson` in `directory`.
+    ///
+    /// `now` is a parameter rather than always `Date()` because crash recovery writes the
+    /// `ended` row on the *next* launch: its end time must be the last frame the crashed
+    /// session captured, not the moment recovery happened.
+    func append(to directory: URL, now: Date = Date()) {
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let url = directory.appendingPathComponent("meta.ndjson")
+            let line = try ndjson(now: now)
+            if let handle = try? FileHandle(forWritingTo: url) {
+                defer { try? handle.close() }
+                try handle.seekToEnd()
+                try handle.write(contentsOf: line)
+            } else {
+                try line.write(to: url, options: .atomic)
+            }
+        } catch {
+            NSLog("[MapleReplay] failed to write meta row: \(error)")
+        }
+    }
+
     /// ClickHouse `DateTime64(3)` literal: `YYYY-MM-DD HH:MM:SS.mmm`, always UTC.
     static func clickHouseDateTime(_ date: Date) -> String {
         let formatter = DateFormatter()

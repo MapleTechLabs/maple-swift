@@ -18,38 +18,74 @@ final class ReplayRecorder {
 
     private let workQueue = DispatchQueue(label: "dev.maple.replay.work", qos: .utility)
     private var buffer: FrameRingBuffer
+    /// Disk mirror of `buffer`. Nil when crash recovery is disabled.
+    private let spool: FrameSpool?
     private var timer: DispatchSourceTimer?
 
     private var chunkSeq = 0
     private var segmentStart: Date?
     private var isRunning = false
 
-    /// Segments produced so far. Milestone 1 keeps these for inspection; milestone 2
-    /// replaces this with an upload queue.
+    /// Segments produced so far, for inspection. Only the records — the bodies are
+    /// handed to `onSegment` and released, so a long session does not accumulate every
+    /// chunk it ever uploaded in memory.
     private(set) var artifacts: [SegmentArtifacts] = []
 
-    var onSegment: ((SegmentArtifacts) -> Void)?
+    /// Called on `workQueue` as each segment is prepared, with the bytes to upload.
+    var onSegment: ((PreparedSegment) -> Void)?
 
-    init(sessionId: String, options: ReplayOptions) {
+    init(
+        sessionId: String,
+        options: ReplayOptions,
+        startedAt: Date = Date(),
+        serviceName: String = "ios-app",
+        environment: String? = nil,
+        userId: String = ""
+    ) {
         self.sessionId = sessionId
         self.options = options
         self.touchObserver = TouchObserver(tracker: touches)
-        self.buffer = FrameRingBuffer(
-            capacity: FrameRingBuffer.capacity(
-                forSeconds: options.flushPolicy.retainedSeconds,
-                frameRate: options.frameRate
-            )
+        let capacity = FrameRingBuffer.capacity(
+            forSeconds: options.flushPolicy.retainedSeconds,
+            frameRate: options.frameRate
         )
-        let root = options.outputDirectory ?? Self.defaultOutputDirectory()
+        self.buffer = FrameRingBuffer(capacity: capacity)
+
+        let root = Self.rootDirectory(options: options)
         self.writer = SegmentWriter(
             directory: root.appendingPathComponent(sessionId, isDirectory: true),
-            sessionId: sessionId
+            sessionId: sessionId,
+            persistToDisk: options.writeSegmentsToDisk
         )
+
+        self.spool = options.crashRecovery
+            ? FrameSpool(
+                root: root,
+                manifest: SpoolManifest(
+                    sessionId: sessionId,
+                    startedAt: startedAt.timeIntervalSince1970,
+                    frameRate: options.frameRate,
+                    quality: options.quality.rawValue,
+                    serviceName: serviceName,
+                    environment: environment,
+                    userId: userId,
+                    nextChunkSeq: 0,
+                    recoveryAttempts: 0
+                ),
+                capacity: capacity,
+                byteBudget: options.maxSpoolBytes
+            )
+            : nil
     }
 
     static func defaultOutputDirectory() -> URL {
         let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
         return caches.appendingPathComponent("maple-replay", isDirectory: true)
+    }
+
+    /// Directory holding every session's output and the shared `spool/`.
+    static func rootDirectory(options: ReplayOptions) -> URL {
+        options.outputDirectory ?? defaultOutputDirectory()
     }
 
     var outputDirectory: URL { writer.directory }
@@ -84,6 +120,11 @@ final class ReplayRecorder {
         timer?.cancel()
         timer = nil
         touchObserver.detach()
+
+        // Queued behind any in-flight flush, so the spool outlives the frames it is
+        // protecting and is deleted only once they have been written as a segment.
+        // Deleting it here is what makes a surviving spool mean "this session crashed".
+        workQueue.async { [spool] in spool?.remove() }
     }
 
     // MARK: - Capture
@@ -99,6 +140,10 @@ final class ReplayRecorder {
     private func ingest(_ pending: PendingFrame) {
         guard let frame = RedactionPainter.redactAndCompress(pending, options: options) else { return }
         buffer.append(frame)
+        // The frame reaching the spool is the same object the buffer holds — already
+        // redacted and compressed by the painter above. There is no path by which an
+        // unredacted frame reaches disk.
+        spool?.append(frame)
 
         if case .continuous(let segmentDuration) = options.flushPolicy {
             let start = segmentStart ?? frame.timestamp
@@ -111,10 +156,15 @@ final class ReplayRecorder {
     // MARK: - Flush
 
     /// Emit whatever is buffered. This is the seam error-triggered capture hangs off:
-    /// in buffered mode nothing is written until someone calls this.
-    func flush(trigger: String) {
+    /// in buffered mode nothing is emitted until someone calls this.
+    ///
+    /// `completion` runs on `workQueue` once the segment has been prepared and handed to
+    /// `onSegment` — which is where its upload starts, not where it finishes. Waiting for
+    /// the network is the transport's job.
+    func flush(trigger: String, completion: (() -> Void)? = nil) {
         workQueue.async { [weak self] in
             self?.emitSegment(reason: trigger)
+            completion?()
         }
     }
 
@@ -129,47 +179,35 @@ final class ReplayRecorder {
         let end = frames.last?.timestamp ?? start
         segmentStart = Date()
 
+        // Drop the disk copy at the same moment the buffer is drained, before encoding
+        // rather than after. The two copies then fail identically: a crash during encode
+        // loses the segment from memory and disk alike. Clearing after a successful write
+        // would instead leave a window in which recovery re-emits a segment that was
+        // already emitted, under a sequence number that is now taken.
+        spool?.clearFrames(nextChunkSeq: chunkSeq)
+
         do {
             let temporaryURL = FileManager.default.temporaryDirectory
                 .appendingPathComponent("maple-segment-\(seq)-\(UUID().uuidString).mp4")
             let video = try VideoEncoder.encode(frames: frames, options: options, to: temporaryURL)
 
-            var events: [RRWebEvent] = [
-                .meta(
-                    timestamp: start,
-                    width: video.width,
-                    height: video.height,
-                    href: "maple://replay/\(sessionId)"
-                ),
-                .video(
-                    timestamp: start,
-                    segmentId: seq,
-                    size: video.byteSize,
-                    durationMs: Int((video.duration * 1000).rounded()),
-                    width: video.width,
-                    height: video.height,
-                    frameCount: video.frameCount,
-                    frameRate: video.frameRate,
-                    base64: (try? Data(contentsOf: video.url).base64EncodedString()) ?? ""
-                ),
-                .breadcrumb(
-                    timestamp: start,
-                    category: "replay.segment",
-                    message: reason,
-                    data: ["frameCount": video.frameCount]
-                ),
-            ]
-            events.append(contentsOf: touches.drain(until: end))
-            events.sort { $0.timestamp < $1.timestamp }
+            let events = SegmentEvents.build(
+                sessionId: sessionId,
+                chunkSeq: seq,
+                video: video,
+                start: start,
+                reason: reason,
+                extra: touches.drain(until: end)
+            )
 
             // Every segment stands alone: it opens with a meta event and an IDR-keyframed
             // video, so any segment is a valid seek target. On the web side that is what
             // `is_checkpoint` marks, so every mobile chunk is a checkpoint.
-            let artifact = try writer.write(
+            let segment = try writer.prepare(
                 video: video, events: events, chunkSeq: seq, isCheckpoint: true
             )
-            artifacts.append(artifact)
-            onSegment?(artifact)
+            artifacts.append(segment.artifacts)
+            onSegment?(segment)
         } catch {
             NSLog("[MapleReplay] segment \(seq) failed: \(error)")
         }

@@ -2,20 +2,64 @@
 
 Session replay capture for iOS.
 
-**Milestone 1 — capture only.** There is no networking yet. Segments are written to disk in
-exactly the form they will be transmitted, so adding upload is a transport swap rather than a
-rewrite.
+Masked screenshots, encoded to H.264 and uploaded to Maple's ingest gateway.
 
 ```swift
 import MapleReplay
 
 var options = ReplayOptions()
+options.ingestKey = "maple_pk_…"              // required
 options.flushPolicy = .buffered(window: 30)   // or .continuous(segmentDuration: 5)
 MapleReplay.shared.start(options: options, serviceName: "my-app")
 
-// In buffered mode nothing is written until something asks for it:
+// In buffered mode nothing is emitted until something asks for it:
 MapleReplay.shared.flush(trigger: "error")
 ```
+
+`start()` refuses to record without a well-formed key — assertion in debug, a log line and no
+recording in release. A capture that can never be delivered costs the user battery and gains them
+nothing, and the 401 it would earn is invisible behind a transport whose whole job is to swallow
+failures.
+
+## Upload
+
+Three POSTs, all best-effort, none retried.
+
+| Endpoint | Body | When |
+| --- | --- | --- |
+| `/v1/sessionReplays/meta` | NDJSON, one row | `active` at session start, `ended` at session end |
+| `/v1/sessionReplays/blob` | the gzipped chunk, verbatim | as each segment is produced |
+| `/v1/sessionEvents` | NDJSON, one row per event | batched `track(_:properties:)` calls |
+
+The **meta row is the billed unit** and the only thing that makes a session exist in the UI; blobs
+are not metered. An SDK that uploads chunks and never posts one bills nothing and records into a
+void, so the `ended` row keeps going even after uploads have been cut off.
+
+### Why there are no retries
+
+The gateway assumes clients drop on non-2xx and says so in the handler. `413` is not a transient
+error — it means this session spent its 1 GiB decompressed budget and every further chunk will be
+rejected before it is read. `429` is backpressure. Retrying either is arguing with a server that
+is asking for less. So a failure drops the payload, and the only thing a response can change is
+whether we stop:
+
+| Status | What happens |
+| --- | --- |
+| `413` | Stop uploading chunks for this session. Metadata still goes — a truncated session still has to end cleanly. |
+| `402` | Entitlement denied. Stop everything for this session. |
+| `429`, `5xx`, transport errors | Drop the payload, keep going. |
+
+Failures warn at most once every 30 s, matching the browser SDK, so a misconfigured endpoint is
+visible in the log without flooding it.
+
+### Sessions end at the background transition
+
+There is no `keepalive` and no unload beacon on iOS, so backgrounding is the last moment anything
+can be sent. On `UIApplication.didEnterBackground` the SDK flushes the tail, posts the `ended` row,
+and holds a `UIApplication` background task open until those requests finish (8 s ceiling — the OS
+kills an app that overruns). Coming back to the foreground starts a **new** session with a new id:
+a session that has reported itself ended must not keep recording under the same id, and the
+per-session byte budget resets with it.
 
 ## Approach
 
@@ -53,11 +97,14 @@ draws the rects live, so a wrong mask is visible immediately instead of after ex
 
 Per segment, in `<caches>/maple-replay/<session-id>/`:
 
+Nothing is written to disk on the upload path. Set `options.writeSegmentsToDisk = true` and each
+segment is also mirrored to `<caches>/maple-replay/<session-id>/`, which is how this gets debugged:
+
 | File | What it is |
 | --- | --- |
-| `segment-NNN.json.gz` | The gzipped rrweb event array — the future `POST /v1/sessionReplays/blob` body |
+| `segment-NNN.json.gz` | The gzipped rrweb event array — byte-for-byte the `POST /v1/sessionReplays/blob` body |
 | `segment-NNN.mp4` | The same video, kept unreferenced so a human can double-click it |
-| `meta.ndjson` | Rows for `POST /v1/sessionReplays/meta` |
+| `meta.ndjson` | The rows posted to `POST /v1/sessionReplays/meta` |
 
 Events per segment: an rrweb `meta` (type 4), a `custom` event (type 5) tagged `video` carrying the
 MP4 as base64, a segment breadcrumb, and touch events as `incrementalSnapshot` (type 3).
@@ -121,6 +168,19 @@ xcodebuild build -project ReplayDemo.xcodeproj -scheme ReplayDemo \
 It has both a SwiftUI and a UIKit screen full of deliberate PII, a mask-preview toggle, mode and
 quality switches, and a button that fires `flush(trigger:)`.
 
+Point it at a gateway with environment variables rather than an edit-and-rebuild cycle:
+
+```bash
+SIMCTL_CHILD_MAPLE_ENDPOINT=http://localhost:3475 \
+SIMCTL_CHILD_MAPLE_INGEST_KEY=MAPLE_TEST \
+xcrun simctl launch booted dev.maple.ReplayDemo
+```
+
+`MAPLE_TEST` is the gateway's sentinel key: it authenticates, and everything sent under it is
+accepted and discarded — useful for exercising the request path without a real key. Note the
+gateway logs rejections but not successes, so a recording proxy in front of it is the only way to
+watch the 200s.
+
 ## Not here yet
 
-Upload, the meta/blob POSTs, playback, crash-recovery of in-flight segments, and Android.
+Playback and Android.

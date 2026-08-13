@@ -44,10 +44,33 @@ final class RecorderController: ObservableObject {
     @Published private(set) var segments: [SegmentArtifacts] = []
     @Published private(set) var sessionId: String?
 
+    /// Ingest target, overridable at launch so the demo can be pointed at a local
+    /// gateway without an edit-and-rebuild cycle:
+    ///
+    /// ```
+    /// MAPLE_ENDPOINT=http://127.0.0.1:3475 MAPLE_INGEST_KEY=maple_pk_… <run the app>
+    /// ```
+    ///
+    /// `MAPLE_TEST` is the gateway's sentinel key: it authenticates, and everything sent
+    /// under it is accepted and discarded.
+    private var endpoint: URL {
+        ProcessInfo.processInfo.environment["MAPLE_ENDPOINT"]
+            .flatMap(URL.init(string:)) ?? URL(string: "https://ingest.maple.dev")!
+    }
+
+    private var ingestKey: String {
+        ProcessInfo.processInfo.environment["MAPLE_INGEST_KEY"] ?? "MAPLE_TEST"
+    }
+
     var options: ReplayOptions {
         var options = ReplayOptions()
         options.quality = quality
         options.flushPolicy = mode == .continuous ? .defaultContinuous : .defaultBuffered
+        options.ingestKey = ingestKey
+        options.endpoint = endpoint
+        // The demo is the surface these get inspected on, so keep the disk copy: the
+        // chunk on disk is byte-for-byte the body that was POSTed.
+        options.writeSegmentsToDisk = true
         return options
     }
 
@@ -61,7 +84,8 @@ final class RecorderController: ObservableObject {
             options: options, serviceName: "replay-demo", environment: "development"
         )
         sessionId = MapleReplay.shared.sessionId
-        isRecording = true
+        isRecording = MapleReplay.shared.isRecording
+        print("[ReplayDemo] endpoint=\(endpoint.absoluteString) session=\(sessionId ?? "none")")
     }
 
     func stop() {

@@ -32,6 +32,36 @@ enum Gzip {
         return out
     }
 
+    /// Inverse of `compress`. Test-only — nothing in the SDK reads a chunk back, but
+    /// asserting on what was actually sent means being able to read it.
+    static func decompress(_ data: Data) -> Data? {
+        // 10-byte fixed header, no optional fields (we never emit FLG != 0), and an
+        // 8-byte CRC32 + ISIZE trailer.
+        guard data.count > 18,
+              data[data.startIndex] == 0x1F,
+              data[data.startIndex + 1] == 0x8B,
+              data[data.startIndex + 2] == 0x08,
+              data[data.startIndex + 3] == 0x00 else { return nil }
+
+        let deflated = data.dropFirst(10).dropLast(8)
+        let isize = data.suffix(4).reversed().reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
+
+        // `compression_decode_buffer` needs the output size up front; ISIZE is exactly
+        // that. Guard against a hostile length so a bad trailer can't ask for gigabytes.
+        let capacity = max(1, min(Int(isize), 256 * 1024 * 1024))
+        let destination = UnsafeMutablePointer<UInt8>.allocate(capacity: capacity)
+        defer { destination.deallocate() }
+
+        let written = Data(deflated).withUnsafeBytes { raw -> Int in
+            guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return 0 }
+            return compression_decode_buffer(
+                destination, capacity, base, raw.count, nil, COMPRESSION_ZLIB
+            )
+        }
+        guard written > 0 else { return nil }
+        return Data(bytes: destination, count: written)
+    }
+
     private static func deflate(_ data: Data) -> Data? {
         let capacity = max(64, data.count)
         let destination = UnsafeMutablePointer<UInt8>.allocate(capacity: capacity)
