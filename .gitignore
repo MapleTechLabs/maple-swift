@@ -1,0 +1,8 @@
+.DS_Store
+.build/
+.swiftpm/
+DerivedData/
+# The demo project is generated from project.yml by xcodegen — project.yml is the source.
+*.xcodeproj/
+*.xcworkspace/
+Package.resolved
