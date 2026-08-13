@@ -245,25 +245,91 @@ final class RedactionScannerTests: XCTestCase {
 final class RedactionPainterTests: XCTestCase {
     /// H.264 chroma subsampling requires even dimensions; AVAssetWriter accepts odd ones
     /// and then produces a file that decodes to garbage.
+    ///
+    /// Swept over odd point sizes and every tier scale, including the above-1x tier and a
+    /// fractional scale from the `maxOutputDimension` ceiling — 2x of an odd number is
+    /// even, but 0.5x and 0.937x of one are not.
     func testScaledSizeIsAlwaysEven() {
-        for maxDimension in [CGFloat(512), 854, 1_280] {
-            let size = RedactionPainter.scaledSize(
-                for: CGSize(width: 1_179, height: 2_556), maxDimension: maxDimension
-            )
-            XCTAssertEqual(Int(size.width) % 2, 0, "width \(size.width) must be even")
-            XCTAssertEqual(Int(size.height) % 2, 0, "height \(size.height) must be even")
-            XCTAssertLessThanOrEqual(max(size.width, size.height), maxDimension + 1)
+        let pointSizes = [
+            CGSize(width: 402, height: 874),   // iPhone 17 Pro
+            CGSize(width: 393, height: 853),   // odd on both edges
+            CGSize(width: 1_024, height: 1_366),  // iPad, where the ceiling bites
+            CGSize(width: 375, height: 667),
+        ]
+        let scales: [CGFloat] = [0.5, 1, 2, 0.937, 1.333]
+
+        for pointSize in pointSizes {
+            for scale in scales {
+                let size = RedactionPainter.scaledSize(for: pointSize, scale: scale)
+                XCTAssertEqual(
+                    Int(size.width) % 2, 0, "width \(size.width) must be even (\(pointSize) @\(scale))"
+                )
+                XCTAssertEqual(
+                    Int(size.height) % 2, 0, "height \(size.height) must be even (\(pointSize) @\(scale))"
+                )
+            }
+        }
+    }
+
+    /// The same guarantee, reached through the tiers rather than through raw scales — the
+    /// path the recorder actually takes.
+    func testEveryTierProducesEvenDimensions() {
+        let pointSizes = [
+            CGSize(width: 402, height: 874),
+            CGSize(width: 393, height: 853),
+            CGSize(width: 1_024, height: 1_366),
+        ]
+        for pointSize in pointSizes {
+            for quality in ReplayQuality.allCases {
+                let size = RedactionPainter.scaledSize(
+                    for: pointSize, scale: quality.effectiveScale(forPointSize: pointSize)
+                )
+                XCTAssertEqual(Int(size.width) % 2, 0, "\(quality) width \(size.width) @ \(pointSize)")
+                XCTAssertEqual(Int(size.height) % 2, 0, "\(quality) height \(size.height) @ \(pointSize)")
+            }
         }
     }
 
     func testAspectRatioIsPreserved() {
         let source = CGSize(width: 1_000, height: 2_000)
-        let scaled = RedactionPainter.scaledSize(for: source, maxDimension: 500)
+        let scaled = RedactionPainter.scaledSize(for: source, scale: 0.5)
         XCTAssertEqual(scaled.width / scaled.height, source.width / source.height, accuracy: 0.01)
     }
 
-    func testSmallerThanTargetIsNotUpscaled() {
-        let scaled = RedactionPainter.scaledSize(for: CGSize(width: 100, height: 200), maxDimension: 512)
-        XCTAssertEqual(scaled, CGSize(width: 100, height: 200))
+    /// The regression this file exists to pin: the tiers must be separated on a phone.
+    ///
+    /// They were calibrated as absolute pixel caps (512/854/1280) while capture ran at 1x
+    /// points, so on a 402x874 pt window `medium` and `high` both landed within 4% of the
+    /// native size and the setting did nothing above `low`.
+    func testTiersAreSeparatedOnAPhone() {
+        let phone = CGSize(width: 402, height: 874)
+        let sizes = ReplayQuality.allCases.map { quality in
+            RedactionPainter.scaledSize(
+                for: phone, scale: quality.effectiveScale(forPointSize: phone)
+            )
+        }
+
+        for (smaller, larger) in zip(sizes, sizes.dropFirst()) {
+            XCTAssertEqual(
+                larger.width / smaller.width, 2, accuracy: 0.02,
+                "each tier should double the linear resolution: \(smaller) -> \(larger)"
+            )
+        }
+        // 201x437 rounded up to even.
+        XCTAssertEqual(sizes.first, CGSize(width: 202, height: 438))
+        XCTAssertEqual(sizes.last, CGSize(width: 804, height: 1_748))
+    }
+
+    /// The ceiling is a memory bound, not a tier: it must clamp `high` on an iPad without
+    /// touching the phone case.
+    func testCeilingClampsLargeWindowsOnly() {
+        let pad = CGSize(width: 1_024, height: 1_366)
+        XCTAssertEqual(
+            ReplayQuality.high.effectiveScale(forPointSize: pad),
+            ReplayQuality.maxOutputDimension / 1_366,
+            accuracy: 0.001
+        )
+        XCTAssertEqual(ReplayQuality.high.effectiveScale(forPointSize: CGSize(width: 402, height: 874)), 2)
+        XCTAssertEqual(ReplayQuality.low.effectiveScale(forPointSize: pad), 0.5)
     }
 }

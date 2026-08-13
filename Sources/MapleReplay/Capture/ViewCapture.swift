@@ -28,9 +28,11 @@ enum ViewCapture {
         window.layoutIfNeeded()
 
         let format = UIGraphicsImageRendererFormat()
-        // Capture at 1x. The frame gets downscaled to the quality tier's maxDimension
-        // anyway, so rendering at 3x only burns memory and time.
-        format.scale = 1
+        // Rasterise at the tier's scale, not at the device's. Capturing above the tier
+        // only to downscale afterwards burns memory and time for pixels that get thrown
+        // away; capturing below it caps the detail the tier is allowed to keep, which is
+        // what made `high` indistinguishable from `medium` when this was pinned to 1.
+        format.scale = options.quality.effectiveScale(forPointSize: bounds.size)
         format.opaque = true
 
         let renderer = UIGraphicsImageRenderer(bounds: bounds, format: format)

@@ -62,24 +62,43 @@ Per segment, in `<caches>/maple-replay/<session-id>/`:
 Events per segment: an rrweb `meta` (type 4), a `custom` event (type 5) tagged `video` carrying the
 MP4 as base64, a segment breadcrumb, and touch events as `incrementalSnapshot` (type 3).
 
+## Quality tiers
+
+A tier is a multiple of the window's own size in points, not an absolute pixel cap:
+
+| Quality | Pixels per point | On a 402×874 pt phone |
+| --- | --- | --- |
+| low | 0.5× | 202×438 |
+| medium | 1× | 402×874 |
+| high | 2× | 804×1748 |
+
+Capture scale follows the tier, so `high` rasterises at 2× and genuinely resolves detail the point
+grid can't. A single ceiling of 2048 px on the longest edge bounds worst-case memory; it only binds
+on iPad.
+
+Absolute pixel caps don't work here. A phone window is ~400×875 pt and capture ran at 1×, so caps
+of 854 and 1280 px both landed on the native size — `medium` and `high` came out within 4% of each
+other and the setting did nothing above `low`. Rendering at 2× costs about 1 ms and a 5.4 MB
+transient bitmap per frame; at 1 fps that is not a cost worth avoiding.
+
 ## Measured sizes
 
-25 frames (25 s) at 1 fps on an iPhone 17 Pro, mostly-static screens:
+31 frames (a full 30 s buffered window) at 1 fps, mostly-static screens, iPhone 17 Pro simulator:
 
 | Quality | Resolution | MP4 | B/frame | Gzipped chunk |
 | --- | --- | --- | --- | --- |
-| low | 236×512 | 11.9 KB | 477 | 7.0 KB |
-| medium | 394×854 | ~19 KB | 675 | ~11 KB |
-| high | 402×874 | 18.9 KB | 757 | 11.1 KB |
+| low | 202×438 | 11.5 KB | 380 | 7.2 KB |
+| medium | 402×874 | 21.8 KB | 721 | 12.9 KB |
+| high | 804×1748 | 37.7 KB | 1246 | 15.3 KB |
 
-The gzipped chunk lands at roughly 0.6–1.0× the raw MP4 despite base64's 33% inflation, because a
+The gzipped chunk lands at roughly 0.4–0.6× the raw MP4 despite base64's 33% inflation, because a
 near-static screen produces a highly compressible H.264 bitstream. **Carrying the MP4 as base64
-inside the JSON chunk is comfortably viable** — a 30 s buffered segment measured 12.8 KB — which
-means an upload path needs no gateway changes at all.
+inside the JSON chunk is comfortably viable** — a full 30 s buffered segment is 12.9 KB at the
+default tier, and 15.3 KB even at 2× resolution — which means an upload path needs no gateway
+changes at all.
 
-Known gap: capture happens at 1× points, so on a 402 pt-wide device `medium` and `high` barely
-differ. The tiers are calibrated in pixels and want recalibrating, or `high` should capture above
-1×.
+Four times the pixels costs 1.7× the MP4 and 1.2× the chunk: H.264 spends its bits on the parts of
+the frame that change, and resolution mostly buys sharper still detail rather than more bitstream.
 
 ## Development
 

@@ -6,13 +6,18 @@ import UIKit
 /// Runs off the main thread. The output of this type is the first representation of a
 /// frame that is allowed to be retained or written anywhere.
 enum RedactionPainter {
-    /// Slack added to every redaction rect, in output pixels.
+    /// Slack added to every redaction rect, in points. Converted to output pixels below.
     static let redactionPadding: CGFloat = 2
 
-    /// Redact, downscale to the quality tier, and JPEG-compress.
+    /// Redact, resample to the quality tier, and JPEG-compress.
     static func redactAndCompress(_ pending: PendingFrame, options: ReplayOptions) -> CapturedFrame? {
         let source = pending.image
-        let targetSize = scaledSize(for: source.size, maxDimension: options.quality.maxDimension)
+        let targetSize = scaledSize(
+            for: source.size,
+            scale: options.quality.effectiveScale(forPointSize: source.size)
+        )
+        // Points-to-output-pixels. Derived from the rounded target rather than from the
+        // requested scale, so the evening-off below can't shift the masks off their glyphs.
         let scale = targetSize.width / max(source.size.width, 1)
 
         let format = UIGraphicsImageRendererFormat()
@@ -27,14 +32,19 @@ enum RedactionPainter {
             // pixelation radius that is safe for one font size is not for another.
             // A flat fill has no such failure mode.
             UIColor.black.setFill()
+            // Inflate before filling. A rect that exactly matches the reported bounds
+            // bleeds: glyphs render marginally outside their layer's bounds, and the
+            // resample to the quality tier introduces sub-pixel offsets. Both were
+            // observed as a thin line of character tops surviving above the mask.
+            //
+            // The slack is specified in points and converted here, so a tier change can't
+            // quietly shrink it — at a 2x tier a flat 2 output pixels would be one point,
+            // half the slack `low` gets. The floor keeps at least two *pixels* as well,
+            // which is what the sub-pixel offset needs at tiers below 1x.
+            let padding = max(Self.redactionPadding, Self.redactionPadding * scale)
             for rect in pending.redactions {
                 let scaled = rect.applying(CGAffineTransform(scaleX: scale, y: scale))
-                // Inflate before filling. A rect that exactly matches the reported bounds
-                // bleeds: glyphs render marginally outside their layer's bounds, and the
-                // downscale to the quality tier introduces sub-pixel offsets. Both were
-                // observed as a thin line of character tops surviving above the mask.
-                // Two pixels of slack costs nothing and removes the whole class of leak.
-                context.fill(scaled.insetBy(dx: -Self.redactionPadding, dy: -Self.redactionPadding).integral)
+                context.fill(scaled.insetBy(dx: -padding, dy: -padding).integral)
             }
         }
 
@@ -44,15 +54,16 @@ enum RedactionPainter {
         return CapturedFrame(jpeg: jpeg, timestamp: pending.timestamp, size: targetSize)
     }
 
-    /// Fit within `maxDimension` on the longest edge, preserving aspect ratio.
+    /// Output size in pixels for a window of `size` points at `scale` pixels per point.
     ///
     /// Both dimensions are rounded to even numbers: H.264 chroma subsampling requires it,
-    /// and AVAssetWriter silently produces a corrupt file for odd dimensions.
-    static func scaledSize(for size: CGSize, maxDimension: CGFloat) -> CGSize {
-        let longest = max(size.width, size.height)
-        let ratio = longest > maxDimension ? maxDimension / longest : 1
-        let width = (size.width * ratio).rounded()
-        let height = (size.height * ratio).rounded()
+    /// and AVAssetWriter silently produces a corrupt file for odd dimensions. This holds
+    /// for every scale, including the above-1x tiers — an odd point dimension times 2 is
+    /// even, but 0.5x of an odd one is not, and neither is a fractional scale from the
+    /// `maxOutputDimension` ceiling.
+    static func scaledSize(for size: CGSize, scale: CGFloat) -> CGSize {
+        let width = (size.width * scale).rounded()
+        let height = (size.height * scale).rounded()
         return CGSize(width: evenized(width), height: evenized(height))
     }
 
