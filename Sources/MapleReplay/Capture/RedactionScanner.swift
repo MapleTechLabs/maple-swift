@@ -109,7 +109,15 @@ struct RedactionScanner {
         // child views — so the host is not a leaf, and every string it rendered would
         // otherwise never be examined. Masking the host wholesale would redact the screen;
         // masking its drawing layers individually is precise.
-        result.append(contentsOf: contentLayerRects(of: view, root: root))
+        //
+        // Gated on `maskAllText` for the same reason as the unknown-leaf rule: a
+        // `CGDrawingLayer` carries no type information, so we cannot tell a rendered
+        // string from a rendered image and must treat the whole category as text.
+        // A consequence worth stating plainly: SwiftUI-drawn images are covered by
+        // `maskAllText`, not by `maskAllImages`, which only reaches `UIImageView`.
+        if options.maskAllText {
+            result.append(contentsOf: contentLayerRects(of: view, root: root))
+        }
 
         for subview in view.subviews {
             scan(subview, root: root, excluding: excluding, into: &result)
@@ -187,6 +195,19 @@ struct RedactionScanner {
         if isMember(view, ofAny: options.maskedViewClasses) { return true }
         if isMember(view, ofAny: Self.alwaysMaskedTypes) { return true }
 
+        // Anything the user can type into, identified structurally.
+        //
+        // `UITextInput` is the protocol UIKit requires of every view that accepts text
+        // entry, so conformance — not a class name — is what identifies one. That matters
+        // for SwiftUI, whose `TextField` and `SecureField` are backed by private views
+        // (`SwiftUI.TextEditorTextView` and friends) whose names change between releases.
+        // Conformance is part of the platform contract and doesn't.
+        //
+        // Unconditional, above every option: typed input is the category Apple's
+        // enforcement history is actually about — the 2019 session-replay removals turned
+        // on card and passport numbers leaking out of form fields.
+        if view is UITextInput { return true }
+
         if options.maskAllText {
             if view is UILabel { return true }
             // A secure field is masked above via UITextField, but a custom conformer isn't.
@@ -202,7 +223,12 @@ struct RedactionScanner {
         // The unknown-leaf rule. Anything that draws its own content and has no children
         // is unidentifiable — most SwiftUI text and images land here, under private class
         // names we deliberately do not enumerate.
-        if view.subviews.isEmpty, drawsOwnContent(view) { return true }
+        //
+        // Gated on `maskAllText`, because "unidentifiable drawn content" is overwhelmingly
+        // text and this rule is what the option is really controlling. Ungated, it made
+        // `maskAllText` and `maskAllImages` inert on SwiftUI: turning both off changed
+        // nothing, because this rule masked everything anyway.
+        if options.maskAllText, view.subviews.isEmpty, drawsOwnContent(view) { return true }
 
         return false
     }

@@ -9,6 +9,8 @@ struct ReplayDemoApp: App {
         WindowGroup {
             ZStack(alignment: .bottom) {
                 TabView {
+                    OrdersScreen()
+                        .tabItem { Label("Orders", systemImage: "shippingbox") }
                     SwiftUIScreen()
                         .tabItem { Label("SwiftUI", systemImage: "swift") }
                     UIKitScreen()
@@ -71,6 +73,14 @@ final class RecorderController: ObservableObject {
         // The demo is the surface these get inspected on, so keep the disk copy: the
         // chunk on disk is byte-for-byte the body that was POSTed.
         options.writeSegmentsToDisk = true
+        // Overridable so the two masking policies can be compared without a rebuild:
+        //   MAPLE_MASK_ALL_TEXT=0 MAPLE_MASK_ALL_IMAGES=0 <run>
+        if let text = ProcessInfo.processInfo.environment["MAPLE_MASK_ALL_TEXT"] {
+            options.maskAllText = text != "0"
+        }
+        if let images = ProcessInfo.processInfo.environment["MAPLE_MASK_ALL_IMAGES"] {
+            options.maskAllImages = images != "0"
+        }
         return options
     }
 
