@@ -130,6 +130,28 @@ final class SessionIdTests: XCTestCase {
         XCTAssertFalse(SegmentWriter.isSafeSessionId("emoji-🎬"))
     }
 
+    /// Generated ids must be lowercase.
+    ///
+    /// Regression: `UUID().uuidString` is uppercase on Apple platforms, JavaScript's
+    /// `crypto.randomUUID()` is lowercase, and the backend's `srep_…` public-id codec
+    /// decodes through lowercase hex — so an uppercase id is written to the warehouse
+    /// verbatim and then looked up in lowercase, matching nothing. Verified against
+    /// production: 10 chunks stored under the uppercase id, 0 found under the lowercase
+    /// one the API asked for. Nothing rejected it anywhere along the way.
+    func testGeneratedSessionIdIsLowercase() {
+        for _ in 0..<32 {
+            let id = SegmentWriter.newSessionId()
+            XCTAssertEqual(id, id.lowercased(), "session ids must be lowercase to survive the public-id round trip")
+            XCTAssertTrue(SegmentWriter.isSafeSessionId(id))
+        }
+    }
+
+    /// The validator deliberately accepts uppercase — it mirrors the gateway, which
+    /// does too. This documents that validation is not what protects the round trip.
+    func testValidatorStillAcceptsUppercase() {
+        XCTAssertTrue(SegmentWriter.isSafeSessionId("3F6C4A43-FB6E-445F-B5FD-94B16604D416"))
+    }
+
     func testBlobHeadersMatchTheGatewayContract() {
         let headers = SegmentWriter.headers(
             sessionId: "abc", chunkSeq: 7, isCheckpoint: true, eventCount: 4, durationMs: 5_000

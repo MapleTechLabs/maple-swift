@@ -169,8 +169,10 @@ public final class MapleReplay {
         guard let configuration, recorder == nil else { return }
 
         // The gateway rejects ids outside `[A-Za-z0-9_-]{1,128}`. A bare uuidString
-        // qualifies; anything with braces or colons would 400 at upload time.
-        let id = UUID().uuidString
+        // qualifies; anything with braces or colons would 400 at upload time. It must
+        // also be lowercase to survive the backend's public-id round trip — see
+        // `SegmentWriter.newSessionId()`.
+        let id = SegmentWriter.newSessionId()
         precondition(SegmentWriter.isSafeSessionId(id), "generated session id is not gateway-safe")
         sessionId = id
 

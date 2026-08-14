@@ -112,9 +112,29 @@ struct SegmentWriter {
         ]
     }
 
+    /// A new session id.
+    ///
+    /// **Lowercased, and that is load-bearing.** `UUID().uuidString` is uppercase on
+    /// Apple platforms while JavaScript's `crypto.randomUUID()` is lowercase, and the
+    /// backend's public-id codec is not case-preserving: it encodes `srep_…` from the
+    /// raw id and decodes it back through lowercase hex. So an uppercase id survives
+    /// ingestion, is stored verbatim in the warehouse, and is then looked up in
+    /// lowercase — matching nothing. The session lists (that read path uses the raw id)
+    /// and plays back empty.
+    ///
+    /// Nothing rejects an uppercase id along the way; the gateway's own validator
+    /// accepts `[A-Za-z0-9_-]`. Lowercasing here is what keeps the id that goes out
+    /// equal to the id that comes back.
+    static func newSessionId() -> String {
+        UUID().uuidString.lowercased()
+    }
+
     /// Maple's gateway rejects session ids that don't match `is_safe_replay_id`:
     /// at most 128 characters of `[A-Za-z0-9_-]`. A bare `UUID().uuidString` qualifies
     /// (hyphens are allowed); anything with braces or colons does not.
+    ///
+    /// Note this accepts uppercase, which is why `newSessionId()` has to lowercase —
+    /// validation here is not what keeps the id round-trippable.
     static func isSafeSessionId(_ id: String) -> Bool {
         guard !id.isEmpty, id.count <= 128 else { return false }
         return id.allSatisfy { character in
