@@ -32,6 +32,15 @@ public struct SessionMetaRow {
     func json(now: Date = Date()) -> [String: Any] {
         var resourceAttributes: [String: String] = [
             "maple.session.recorded": recorded ? "true" : "false",
+            // Which engine the web player must use. It reads this from session
+            // metadata so it can choose without first downloading a chunk, and treats
+            // an ABSENT key as "rrweb" — every recording predating the marker is a
+            // browser one. So omitting this does not fail loudly: the player quietly
+            // hands our video segments to the rrweb engine, which needs a type-4
+            // FullSnapshot we will never emit, and renders an empty surface.
+            // Counterpart: `maple.session.replay_format` in
+            // packages/browser-session/src/meta-row.ts, which sends "rrweb".
+            "maple.session.replay_format": "video",
         ]
         if let environment {
             // Dual-emit: the legacy key is pre-extracted by the Tinybird MVs, the

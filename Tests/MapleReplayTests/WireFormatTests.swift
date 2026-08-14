@@ -189,6 +189,26 @@ final class SessionMetaRowTests: XCTestCase {
         XCTAssertEqual(attributes?["deployment.environment.name"], "development")
     }
 
+    /// The marker that tells the web player to use its video engine.
+    ///
+    /// This must be present on BOTH the active and ended rows. The backing table is a
+    /// ReplacingMergeTree that replaces whole rows, so a marker on only one of them is
+    /// lost the moment the other wins.
+    ///
+    /// Regression: without this key the player defaulted to rrweb — the documented
+    /// meaning of an absent marker — and rendered nothing, because rrweb needs a
+    /// FullSnapshot that a video recording never produces. Nothing failed; the surface
+    /// was simply blank, which is why it needs a test rather than vigilance.
+    func testReplayFormatMarkerIsAlwaysVideo() {
+        for status in [SessionMetaRow.Status.active, .ended] {
+            let attributes = row(status: status).json()["resource_attributes"] as? [String: String]
+            XCTAssertEqual(
+                attributes?["maple.session.replay_format"], "video",
+                "\(status.rawValue) row must carry the video marker"
+            )
+        }
+    }
+
     func testGatewayDerivedFieldsAreNotSent() {
         let json = row(status: .active).json()
         // One normalisation at the gateway covers every SDK version in the wild.
