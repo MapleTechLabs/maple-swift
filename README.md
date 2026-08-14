@@ -109,6 +109,48 @@ segment is also mirrored to `<caches>/maple-replay/<session-id>/`, which is how 
 Events per segment: an rrweb `meta` (type 4), a `custom` event (type 5) tagged `video` carrying the
 MP4 as base64, a segment breadcrumb, and touch events as `incrementalSnapshot` (type 3).
 
+## Crash recovery
+
+In `.buffered` mode the ring buffer *is* the recording until something calls `flush(trigger:)`,
+and a crash calls nothing. Without recovery, the 30 seconds before a crash — the most valuable
+recording the SDK can produce, and the whole argument for buffered mode — is the one recording
+guaranteed to be lost.
+
+So every frame is also written to `<caches>/maple-replay/spool/<session-id>/` as it is captured,
+and evicted on the same policy as the ring buffer. The in-memory buffer stays as the fast path for
+ordinary flushes, but the disk copy is **complete**, not a sample — a partial copy recovers a
+partial window, which is the failure this exists to prevent. At 1 fps the cost is one ~20 KB write
+and one unlink per second.
+
+Only redacted frames reach the spool. `RedactionPainter` is the first point a frame may be
+retained anywhere, and the spool takes the same `CapturedFrame` the buffer holds; the unredacted
+bitmap never leaves the main thread.
+
+A spool directory that still exists at the next `start()` means that session never reached
+`stop()`. Cleanup on clean shutdown is what makes the leftover meaningful — no signal handler or
+exception hook is involved, and none of those survive `SIGKILL` or a watchdog kill anyway. The
+frames are encoded into a segment carrying a `replay.crash_recovery` breadcrumb, numbered to
+continue that session's sequence, posted under the **crashed** session's id, and followed by the
+`ended` metadata row stamped with the last frame's time. Then the spool is deleted.
+
+A user swiping the app away leaves the same trace and is recovered the same way. The two are
+indistinguishable on disk, and the window is worth having either way.
+
+Disk is bounded at three levels, because a crash loop leaves a fresh spool on every launch:
+
+| Bound | Default | What it stops |
+| --- | --- | --- |
+| Frame capacity | the window | Ordinary growth — same eviction as the ring buffer |
+| `maxSpoolBytes` | 16 MB | One session whose frames are far larger than its tier implies |
+| `maxTotalSpoolBytes` | 48 MB | A crash loop filling the device one launch at a time |
+
+Two spools are kept at most, newest first, and a spool that has failed to recover twice is
+discarded rather than retried forever — the attempt count is persisted *before* the encode, so a
+crash during recovery still counts. Set `crashRecovery = false` to turn all of it off.
+
+Touch events are not recovered: they only ever lived in memory, so a recovered segment is video
+and timing only.
+
 ## Quality tiers
 
 A tier is a multiple of the window's own size in points, not an absolute pixel cap:
