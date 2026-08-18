@@ -1,4 +1,5 @@
 import Foundation
+import MapleCore
 
 /// What a single flushed segment produced.
 public struct SegmentArtifacts: Sendable {

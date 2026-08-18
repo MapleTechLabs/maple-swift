@@ -12,8 +12,8 @@ import Foundation
 /// the gzip container (RFC 1952), so we wrap it with the 10-byte header and the
 /// CRC32 + ISIZE trailer ourselves. This avoids linking system zlib and keeps the package
 /// dependency-free.
-enum Gzip {
-    static func compress(_ data: Data) -> Data? {
+public enum Gzip {
+    public static func compress(_ data: Data) -> Data? {
         guard !data.isEmpty else { return nil }
         guard let deflated = deflate(data) else { return nil }
 
@@ -34,7 +34,7 @@ enum Gzip {
 
     /// Inverse of `compress`. Test-only — nothing in the SDK reads a chunk back, but
     /// asserting on what was actually sent means being able to read it.
-    static func decompress(_ data: Data) -> Data? {
+    public static func decompress(_ data: Data) -> Data? {
         // 10-byte fixed header, no optional fields (we never emit FLG != 0), and an
         // 8-byte CRC32 + ISIZE trailer.
         guard data.count > 18,
@@ -98,7 +98,7 @@ enum Gzip {
     }
 }
 
-enum CRC32 {
+public enum CRC32 {
     private static let table: [UInt32] = (0...255).map { index -> UInt32 in
         var value = UInt32(index)
         for _ in 0..<8 {
@@ -107,7 +107,7 @@ enum CRC32 {
         return value
     }
 
-    static func checksum(_ data: Data) -> UInt32 {
+    public static func checksum(_ data: Data) -> UInt32 {
         var crc: UInt32 = 0xFFFF_FFFF
         for byte in data {
             crc = table[Int((crc ^ UInt32(byte)) & 0xFF)] ^ (crc >> 8)

@@ -1,5 +1,6 @@
 import AVFoundation
 import UIKit
+import MapleCore
 import XCTest
 @testable import MapleReplay
 

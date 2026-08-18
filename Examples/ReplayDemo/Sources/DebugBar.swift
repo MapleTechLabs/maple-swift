@@ -1,4 +1,4 @@
-import MapleReplay
+import Maple
 import SwiftUI
 
 struct DebugBar: View {

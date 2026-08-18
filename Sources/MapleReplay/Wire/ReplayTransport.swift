@@ -1,23 +1,8 @@
 import Foundation
+import MapleCore
 
-/// Why an ingest key was refused before a single request was made.
-///
-/// Checked client-side because the alternative is a silent recording: the gateway
-/// answers a bad key with 401 on every POST, and a best-effort transport by definition
-/// swallows that. Better to refuse at `start()`, where a developer is looking.
-public enum IngestKeyProblem: Equatable, Sendable, CustomStringConvertible {
-    case missing
-    case wrongPrefix
-
-    public var description: String {
-        switch self {
-        case .missing:
-            return "ReplayOptions.ingestKey is not set. Set it to your public ingest key (maple_pk_…)."
-        case .wrongPrefix:
-            return "ReplayOptions.ingestKey must start with maple_pk_ (or maple_sk_). The gateway rejects anything else with 401."
-        }
-    }
-}
+/// Re-exported so `import MapleReplay` alone still sees the type `start()` reports.
+public typealias IngestKeyProblem = MapleCore.IngestKeyProblem
 
 /// The three `POST`s that make up session replay ingestion.
 ///
@@ -29,6 +14,10 @@ public enum IngestKeyProblem: Equatable, Sendable, CustomStringConvertible {
 /// backpressure. Retrying either is arguing with a server that is telling you to go away.
 /// So every failure drops the payload, and the only state a response can change is
 /// whether we stop sending altogether.
+///
+/// The request plumbing lives in `MapleCore.IngestPoster`, shared with trace export. The
+/// *policy* stays here, because the two subsystems genuinely differ: replay stops
+/// uploading chunks on 413 while metadata keeps going, and traces have no such split.
 final class ReplayTransport {
     /// Gateway body limit. A body over this is rejected with 413 before it is read, so
     /// there is no point spending the upload; drop it here and say so.
@@ -36,41 +25,23 @@ final class ReplayTransport {
 
     /// The gateway's drop-everything token. Authenticates, stores nothing, meters
     /// nothing — useful for pointing a build at a local gateway without a real key.
-    static let sentinelKey = "MAPLE_TEST"
+    static let sentinelKey = IngestKey.sentinel
 
-    private let endpoint: URL
-    private let ingestKey: String
     private let sessionId: String
-    private let urlSession: URLSession
-
-    /// In-flight requests. `awaitPending` is what lets a background task hold the app
-    /// awake exactly as long as the final flush needs.
-    private let pending = DispatchGroup()
+    private let poster: IngestPoster
 
     private let lock = NSLock()
     private var blobsStopped = false
     private var allStopped = false
 
     init(endpoint: URL, ingestKey: String, sessionId: String, urlSession: URLSession? = nil) {
-        self.endpoint = endpoint
-        self.ingestKey = ingestKey
         self.sessionId = sessionId
-        self.urlSession = urlSession ?? Self.defaultURLSession()
-    }
-
-    private static func defaultURLSession() -> URLSession {
-        let configuration = URLSessionConfiguration.ephemeral
-        // Replay is never worth stalling behind: a request that has not completed in
-        // 15s has missed its moment, and holding it open only delays the background
-        // task that is waiting on it.
-        configuration.timeoutIntervalForRequest = 15
-        configuration.timeoutIntervalForResource = 30
-        configuration.httpShouldSetCookies = false
-        configuration.httpCookieAcceptPolicy = .never
-        // Off by default: a request parked waiting for connectivity outlives the
-        // session it belongs to, and a stale chunk is worth less than a fast drop.
-        configuration.waitsForConnectivity = false
-        return URLSession(configuration: configuration)
+        self.poster = IngestPoster(
+            endpoint: endpoint,
+            ingestKey: ingestKey,
+            subsystem: "MapleReplay",
+            urlSession: urlSession
+        )
     }
 
     // MARK: - Key validation
@@ -78,12 +49,7 @@ final class ReplayTransport {
     /// Mirrors `infer_ingest_key_type` at the gateway: anything not prefixed
     /// `maple_pk_`/`maple_sk_` resolves to no key at all and comes back 401.
     static func validate(ingestKey: String?) -> IngestKeyProblem? {
-        guard let key = ingestKey?.trimmingCharacters(in: .whitespacesAndNewlines), !key.isEmpty else {
-            return .missing
-        }
-        if key == sentinelKey { return nil }
-        guard key.hasPrefix("maple_pk_") || key.hasPrefix("maple_sk_") else { return .wrongPrefix }
-        return nil
+        IngestKey.validate(ingestKey)
     }
 
     // MARK: - The three POSTs
@@ -105,7 +71,7 @@ final class ReplayTransport {
                 completion: completion
             )
         } catch {
-            warnOnce("metadata encode", error)
+            MapleLog.warnOnce("MapleReplay", "metadata encode", error)
             completion?()
         }
     }
@@ -119,7 +85,8 @@ final class ReplayTransport {
         let artifacts = segment.artifacts
         guard !isBlobStopped else { completion?(); return }
         guard segment.body.count <= Self.maxBodyBytes else {
-            warnOnce(
+            MapleLog.warnOnce(
+                "MapleReplay",
                 "blob",
                 "chunk \(artifacts.chunkSeq) is \(segment.body.count) bytes, over the \(Self.maxBodyBytes)-byte gateway limit; dropped"
             )
@@ -159,7 +126,7 @@ final class ReplayTransport {
                 completion: completion
             )
         } catch {
-            warnOnce("events encode", error)
+            MapleLog.warnOnce("MapleReplay", "events encode", error)
             completion?()
         }
     }
@@ -172,10 +139,7 @@ final class ReplayTransport {
     /// `UIApplication` background task, and the OS kills the app outright if that task
     /// is not ended in time. Better to give up on a chunk than to be terminated.
     func awaitPending(timeout: TimeInterval, completion: @escaping () -> Void) {
-        DispatchQueue.global(qos: .utility).async { [pending] in
-            _ = pending.wait(timeout: .now() + timeout)
-            completion()
-        }
+        poster.awaitPending(timeout: timeout, completion: completion)
     }
 
     // MARK: - Request plumbing
@@ -198,39 +162,16 @@ final class ReplayTransport {
         what: String,
         completion: (() -> Void)?
     ) {
-        var request = URLRequest(url: url(for: path))
-        request.httpMethod = "POST"
-        request.setValue("Bearer \(ingestKey)", forHTTPHeaderField: "Authorization")
-        request.setValue(contentType, forHTTPHeaderField: "Content-Type")
-        for (name, value) in headers {
-            request.setValue(value, forHTTPHeaderField: name)
+        poster.post(path: path, body: body, contentType: contentType, headers: headers, what: what) { [weak self] outcome in
+            self?.handle(outcome)
+            completion?()
         }
-        request.httpBody = body
-
-        pending.enter()
-        let task = urlSession.dataTask(with: request) { [weak self] _, response, error in
-            defer {
-                self?.pending.leave()
-                completion?()
-            }
-            guard let self else { return }
-            if let error {
-                self.warnOnce(what, error)
-                return
-            }
-            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-            self.handle(status: status, what: what)
-        }
-        task.resume()
     }
 
     /// The whole retry policy, such as it is.
-    private func handle(status: Int, what: String) {
-        switch status {
-        case 200...299:
-            return
-
-        case 413:
+    private func handle(_ outcome: IngestPoster.Outcome) {
+        switch outcome {
+        case .budgetExhausted:
             // The per-session decompressed-byte budget is spent. Every further chunk is
             // rejected before it is read, so stop producing them. Metadata still goes:
             // the session exists and deserves an `ended` row.
@@ -239,54 +180,22 @@ final class ReplayTransport {
             blobsStopped = true
             lock.unlock()
             if !alreadyStopped {
-                NSLog("[MapleReplay] session \(sessionId) hit its ingest byte ceiling; no further chunks will be uploaded")
+                MapleLog.notice("MapleReplay", "session \(sessionId) hit its ingest byte ceiling; no further chunks will be uploaded")
             }
 
-        case 402:
-            // Entitlement denied — nothing from this org is being accepted. Continuing
-            // to POST is pure waste, on the device and at the gateway.
+        case .entitlementDenied:
+            // Nothing from this org is being accepted. Continuing to POST is pure waste,
+            // on the device and at the gateway.
             lock.lock()
             let alreadyStopped = allStopped
             allStopped = true
             lock.unlock()
             if !alreadyStopped {
-                NSLog("[MapleReplay] ingest refused by entitlement (402); replay upload disabled for this session")
+                MapleLog.notice("MapleReplay", "ingest refused by entitlement (402); replay upload disabled for this session")
             }
 
-        case 429:
-            // Backpressure. Dropping is the contract — a retry is more load aimed at a
-            // server that just asked for less.
-            warnOnce(what, "429 backpressure; chunk dropped")
-
-        default:
-            warnOnce(what, "HTTP \(status)")
+        case .delivered, .throttled, .dropped:
+            break
         }
-    }
-
-    private func url(for path: String) -> URL {
-        // Tolerate a configured endpoint with a trailing slash rather than producing
-        // `https://host//v1/…`, which some proxies normalise and some 404.
-        var base = endpoint.absoluteString
-        while base.hasSuffix("/") { base.removeLast() }
-        return URL(string: base + path) ?? endpoint
-    }
-
-    // MARK: - Warning
-
-    // Upload is best-effort and must never throw into the host app, but a wholly broken
-    // endpoint should not be *silent*. Warn at most once every 30s — the same budget the
-    // browser SDK uses — so a misconfiguration is visible without flooding the log.
-    private static let warnLock = NSLock()
-    private static var lastWarnAt = Date.distantPast
-
-    private func warnOnce(_ what: String, _ reason: Any) {
-        Self.warnLock.lock()
-        let now = Date()
-        let shouldWarn = now.timeIntervalSince(Self.lastWarnAt) >= 30
-        if shouldWarn { Self.lastWarnAt = now }
-        Self.warnLock.unlock()
-
-        guard shouldWarn else { return }
-        NSLog("[MapleReplay] session replay \(what) POST failed (dropping, no retry): \(reason)")
     }
 }

@@ -1,35 +1,124 @@
 # maple-swift
 
-Session replay capture for iOS.
+Session replay **and** OpenTelemetry tracing for iOS, in one package.
 
-Masked screenshots, encoded to H.264 and uploaded to Maple's ingest gateway.
+Masked screenshots encoded to H.264, and spans exported as OTLP, both to Maple's ingest gateway.
+Every span carries the live `session.id` and every trace id lands on the session's row, so a trace
+resolves to the recording that produced it and back again — the same contract the browser SDK has.
 
 ```swift
-import MapleReplay
+import Maple
 
-var options = ReplayOptions()
-options.ingestKey = "maple_pk_…"              // required
-options.flushPolicy = .buffered(window: 30)   // or .continuous(segmentDuration: 5)
-MapleReplay.shared.start(options: options, serviceName: "my-app")
+var options = MapleOptions()
+options.ingestKey = "maple_pk_…"                     // required
+options.replay.flushPolicy = .buffered(window: 30)   // or .continuous(segmentDuration: 5)
+Maple.start(options: options, serviceName: "my-app", environment: "production")
 
 // In buffered mode nothing is emitted until something asks for it:
-MapleReplay.shared.flush(trigger: "error")
+Maple.flush(trigger: "error")
 ```
 
-`start()` refuses to record without a well-formed key — assertion in debug, a log line and no
-recording in release. A capture that can never be delivered costs the user battery and gains them
-nothing, and the 401 it would earn is invisible behind a transport whose whole job is to swallow
-failures.
+That single call starts replay, starts tracing, auto-instruments every outgoing `URLSession`
+request with a W3C `traceparent` header, and tracks screens.
+
+`MapleReplay` and `MapleTracing` are also separate products if you want only one of them. Both
+refuse to start without a well-formed key — assertion in debug, a log line and nothing in release.
+Work that can never be delivered costs the user battery and gains them nothing, and the 401 it
+would earn is invisible behind a transport whose whole job is to swallow failures.
+
+## Tracing
+
+```
+Sources/MapleCore     the session/trace join and the shared request plumbing
+Sources/MapleTracing  spans, sampling, OTLP export, URLSession + screen instrumentation
+Sources/MapleReplay   the recorder
+Sources/Maple         both, under one call
+```
+
+`MapleCore` exists so the two signals stay siblings: an app that wants only tracing should not link
+a screenshot recorder to get it. It is the same role `packages/browser-session` plays on the web.
+
+Spans go to `POST /v1/traces` as gzipped **OTLP/JSON** — the gateway accepts it, so there is no
+protobuf dependency and the package still has none at all. Batched every 2 s, dropped rather than
+retried, and force-flushed on `didEnterBackground` inside a `UIApplication` background task, which
+is the last moment anything can be sent on iOS.
+
+### How a session and a trace are joined
+
+Three links, all three the ones the backend already reads:
+
+| Link | Where |
+| --- | --- |
+| `session.id` **span attribute** | stamped on every span at start |
+| `session_replays.TraceIds` | every trace id seen during the session, on the `ended` metadata row — this is what "which recording produced this trace" searches |
+| `session_events.TraceId` | per distilled event |
+
+`session.id` is deliberately **not** a resource attribute. The resource is fixed for the tracer's
+lifetime, but iOS rotates the session on every foreground transition, so a resource-level id would
+attribute every post-rotation span to a session that has already reported itself ended.
+
+### Propagation
+
+Outgoing requests carry `traceparent`, so the span your backend records is a **child** of the
+phone's span rather than the root of an unrelated trace.
+
+By default every host gets the header except Maple's own ingest paths. Set
+`tracing.tracePropagationTargets` to a list of hosts or regexes to keep your trace ids away from
+third-party services — the header is 55 bytes and there is no CORS on native, so the cost of the
+broad default is disclosure, not breakage.
+
+### Why a `URLProtocol` and not swizzled task-creation methods
+
+The obvious approach is to swizzle `URLSession.dataTask(with:…)` and friends. It works for the
+completion-handler and delegate APIs and **silently does not fire for `async` `data(for:)`**, which
+on current iOS does not go through any of those Objective-C selectors.
+
+That failure is invisible from the inside: spans are still produced by everything else, so the SDK
+looks healthy while the API most modern apps actually call ships no `traceparent` at all. It was
+caught only by asserting on bytes that left the process. `URLProtocol` sits underneath every
+`URLSession` API, so there is one interception point and no list of selectors to keep matching
+Apple's.
+
+Two small swizzles remain, and each buys something the protocol cannot:
+
+- `URLSessionTask.resume` captures the caller's active span onto the task. `URLProtocol` runs on
+  the loading thread, where the caller's task-local context is gone — without this, a request made
+  inside a `checkout` span starts its own trace and the backend's span hangs off a root that
+  corresponds to nothing.
+- `URLSessionConfiguration.default`/`.ephemeral` add the interceptor to sessions the app builds
+  itself. `URLProtocol.registerClass` only reaches `URLSession.shared`.
+
+Requests with an `httpBodyStream` are left alone: a stream cannot be replayed, and re-issuing the
+request is exactly what the interceptor does. Losing a span there beats losing the upload.
+
+`instrumentURLSession = .manual` installs none of it; use `MapleTracing.shared.trace(_:)` and
+`traceHeaders()` instead.
+
+### Screens
+
+UIKit controllers are picked up by swizzling `viewDidAppear`/`viewDidDisappear`, giving a
+`ui.screen` span whose duration is time-on-screen. SwiftUI has one `UIHostingController` for the
+whole app, so screens announce themselves — `Maple.trackScreen("Checkout")` from `.onAppear`. Each
+appearance also emits a `navigation` session event, which is what gives a mobile recording a
+transcript beside the video.
+
+### Status codes
+
+`Error` on a transport failure or **5xx only**. A 4xx is the server correctly refusing something,
+and marking those `Error` is what floods an error dashboard with expected outcomes — the ingest
+gateway applies exactly this rule to its own spans, and the platform is easier to read when both
+ends agree. The status code is recorded either way.
 
 ## Upload
 
-Three POSTs, all best-effort, none retried.
+Four POSTs, all best-effort, none retried.
 
 | Endpoint | Body | When |
 | --- | --- | --- |
 | `/v1/sessionReplays/meta` | NDJSON, one row | `active` at session start, `ended` at session end |
 | `/v1/sessionReplays/blob` | the gzipped chunk, verbatim | as each segment is produced |
-| `/v1/sessionEvents` | NDJSON, one row per event | batched `track(_:properties:)` calls |
+| `/v1/sessionEvents` | NDJSON, one row per event | batched `track()`, `navigation` and `network` events |
+| `/v1/traces` | gzipped OTLP/JSON | every 2 s, and on backgrounding |
 
 The **meta row is the billed unit** and the only thing that makes a session exist in the UI; blobs
 are not metered. An SDK that uploads chunks and never posts one bills nothing and records into a
@@ -192,11 +281,12 @@ the frame that change, and resolution mostly buys sharper still detail rather th
 ## Development
 
 ```bash
-xcodebuild test -scheme maple-swift -destination 'platform=iOS Simulator,name=iPhone 17 Pro'
+xcodebuild test -scheme maple-swift-Package -destination 'platform=iOS Simulator,name=iPhone 17 Pro'
 ```
 
 `swift build` does not work — the package is UIKit-only, and SwiftPM builds for macOS by default.
-Use an iOS Simulator destination.
+Use an iOS Simulator destination. The scheme is `maple-swift-Package`, not `maple-swift`: the
+package has several products now, and SwiftPM names the aggregate scheme accordingly.
 
 The demo app is the real verification surface. Redaction correctness is a visual property; no unit
 test substitutes for opening the MP4 and looking at it.
@@ -208,15 +298,26 @@ xcodebuild build -project ReplayDemo.xcodeproj -scheme ReplayDemo \
 ```
 
 It has both a SwiftUI and a UIKit screen full of deliberate PII, a mask-preview toggle, mode and
-quality switches, and a button that fires `flush(trigger:)`.
+quality switches, a button that fires `flush(trigger:)`, and a **Network** tab that makes real
+requests and prints the trace id each one used.
+
+That tab is the verification surface for tracing, for the same reason the PII screens are the one
+for redaction: "the backend span is a child of the phone's span" is not visible anywhere on the
+device. It is a property of what arrives at the warehouse, so the only way to check it is to fire a
+request at a real instrumented backend and go look.
 
 Point it at a gateway with environment variables rather than an edit-and-rebuild cycle:
 
 ```bash
 SIMCTL_CHILD_MAPLE_ENDPOINT=http://localhost:3475 \
 SIMCTL_CHILD_MAPLE_INGEST_KEY=MAPLE_TEST \
+SIMCTL_CHILD_MAPLE_TRACE_TARGET=https://api.maple.dev/v2/services \
 xcrun simctl launch booted dev.maple.ReplayDemo
 ```
+
+`MAPLE_TRACE_TARGET` is the backend the Network tab calls; it defaults to the API sibling of
+whatever ingest host is configured. Deliberately not a `/health` route — the API disables its
+tracer for those, so a request there proves nothing about propagation.
 
 `MAPLE_TEST` is the gateway's sentinel key: it authenticates, and everything sent under it is
 accepted and discarded — useful for exercising the request path without a real key. Note the
@@ -226,3 +327,11 @@ watch the 200s.
 ## Not here yet
 
 Playback and Android.
+
+Known gaps in tracing, all deliberate:
+
+- A **crash-recovered** `ended` row cannot carry that session's trace ids. The sink died with the
+  process, and the row is written on the next launch.
+- **Upload tasks with a body stream** are not traced (see above).
+- `identify()` is not wired to spans yet: `user.id` is stamped by the browser SDK, and the mobile
+  metadata row still sends the identity columns empty.

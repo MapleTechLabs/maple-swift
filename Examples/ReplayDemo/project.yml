@@ -6,7 +6,7 @@ options:
   createIntermediateGroups: true
 
 packages:
-  MapleReplay:
+  Maple:
     path: ../..
 
 targets:
@@ -16,8 +16,8 @@ targets:
     sources:
       - path: Sources
     dependencies:
-      - package: MapleReplay
-        product: MapleReplay
+      - package: Maple
+        product: Maple
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.maple.ReplayDemo

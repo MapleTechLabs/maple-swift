@@ -1,4 +1,5 @@
 import Foundation
+import MapleCore
 import UIKit
 
 /// Session replay for iOS.
@@ -144,17 +145,19 @@ public final class MapleReplay {
     /// Buffered and sent with the next segment rather than immediately: one request per
     /// call would be a lot of radio for a handful of bytes.
     public func track(_ name: String, properties: [String: String] = [:]) {
+        enqueue(SessionEventDraft(kind: .custom, message: name, attributes: properties))
+    }
+
+    /// Buffer a distilled event, whoever raised it.
+    ///
+    /// `MapleTracing` raises `network` and `navigation` events through
+    /// `SessionSink`'s relay; `track()` raises `custom` ones. They share one `Seq`
+    /// counter because `Seq` is in the table's sorting key and two independent counters
+    /// would interleave two event streams at the same ordinal.
+    func enqueue(_ draft: SessionEventDraft) {
         eventLock.lock()
         guard let sessionId, let transport else { eventLock.unlock(); return }
-        pendingEvents.append(
-            SessionEventRow(
-                sessionId: sessionId,
-                seq: eventSeq,
-                type: .custom,
-                message: name,
-                attributes: properties
-            )
-        )
+        pendingEvents.append(SessionEventRow(sessionId: sessionId, seq: eventSeq, draft: draft))
         eventSeq += 1
         let batch = pendingEvents.count >= Self.maxBufferedEvents ? takePendingEventsLocked() : []
         eventLock.unlock()
@@ -188,6 +191,14 @@ public final class MapleReplay {
         pendingEvents.removeAll()
         eventSeq = 0
         eventLock.unlock()
+
+        // Publish before the recorder starts. Every span created from here on carries
+        // this id as its `session.id` attribute, and every trace id it sees is collected
+        // for the `ended` row — the two directions of the session/trace join.
+        SessionSink.shared.publish(sessionId: id)
+        SessionSink.shared.setEventRelay { [weak self] draft in
+            self?.enqueue(draft)
+        }
 
         let recorder = ReplayRecorder(
             sessionId: id,
@@ -247,6 +258,8 @@ public final class MapleReplay {
         self.transport = nil
         let trailingEvents = takePendingEventsLocked()
         eventLock.unlock()
+        SessionSink.shared.publish(sessionId: nil)
+        SessionSink.shared.setEventRelay(nil)
 
         // `retiring` is captured by the completion closure, which the work queue holds
         // until it runs. Without that the recorder would deallocate the moment the
@@ -257,6 +270,7 @@ public final class MapleReplay {
             _ = retiring
             if !trailingEvents.isEmpty { transport.postEvents(trailingEvents) }
             if let meta {
+                let counters = SessionSink.shared.counters(for: meta.sessionId)
                 let ended = SessionMetaRow(
                     sessionId: meta.sessionId,
                     startedAt: meta.startedAt,
@@ -265,7 +279,11 @@ public final class MapleReplay {
                     serviceName: meta.serviceName,
                     environment: meta.environment,
                     userId: meta.userId,
-                    recorded: true
+                    recorded: true,
+                    traceIds: SessionSink.shared.observedTraceIds(for: meta.sessionId),
+                    clickCount: counters.clickCount,
+                    pageViews: counters.pageViews,
+                    errorCount: counters.errorCount
                 )
                 self?.deliver(
                     ended,
@@ -273,6 +291,7 @@ public final class MapleReplay {
                     directory: options?.writeSegmentsToDisk == true ? directory : nil
                 )
             }
+            if let meta { SessionSink.shared.discard(sessionId: meta.sessionId) }
             transport.awaitPending(timeout: Self.backgroundFlushTimeout) {
                 DispatchQueue.main.async { completion?() }
             }

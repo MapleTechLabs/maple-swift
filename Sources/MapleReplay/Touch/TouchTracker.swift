@@ -1,4 +1,5 @@
 import Foundation
+import MapleCore
 import UIKit
 
 /// Records touch locations so the replay shows where the user tapped.
@@ -92,6 +93,9 @@ private final class PassthroughGestureRecognizer: UIGestureRecognizer {
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
         report(touches, as: .touchStart)
+        // Counted on *began* rather than ended, so a tap that turns into a scroll still
+        // counts as an interaction. `ClickCount` is a liveness signal, not a tap total.
+        SessionSink.shared.recordClick()
         // Stay in .possible forever so the recognizer never fires, never transitions to
         // .began, and therefore never interferes with the app's gestures.
         state = .possible

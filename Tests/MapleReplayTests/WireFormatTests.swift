@@ -1,3 +1,4 @@
+import MapleCore
 import XCTest
 @testable import MapleReplay
 

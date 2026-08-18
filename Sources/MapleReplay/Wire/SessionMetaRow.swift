@@ -1,4 +1,5 @@
 import Foundation
+import MapleCore
 import UIKit
 
 /// Builds the `/v1/sessionReplays/meta` NDJSON row.
@@ -28,6 +29,48 @@ public struct SessionMetaRow {
     let environment: String?
     let userId: String
     let recorded: Bool
+
+    /// Trace ids observed during this session, oldest first.
+    ///
+    /// This is the link the UI actually searches: `sessionsForTraceQuery` answers "which
+    /// recording produced this trace" with `has(TraceIds, …)`. It ships on the `ended`
+    /// row only, because that is the first moment the set is complete.
+    let traceIds: [String]
+
+    /// Interaction counters. Previously hardcoded to zero, which made a mobile session
+    /// permanently invisible to the sessions list's "has errors" filter — that filter
+    /// tests `ErrorCount > 0`.
+    let clickCount: Int
+    let pageViews: Int
+    let errorCount: Int
+
+    init(
+        sessionId: String,
+        startedAt: Date,
+        status: Status,
+        version: Int,
+        serviceName: String,
+        environment: String?,
+        userId: String,
+        recorded: Bool,
+        traceIds: [String] = [],
+        clickCount: Int = 0,
+        pageViews: Int = 0,
+        errorCount: Int = 0
+    ) {
+        self.sessionId = sessionId
+        self.startedAt = startedAt
+        self.status = status
+        self.version = version
+        self.serviceName = serviceName
+        self.environment = environment
+        self.userId = userId
+        self.recorded = recorded
+        self.traceIds = traceIds
+        self.clickCount = clickCount
+        self.pageViews = pageViews
+        self.errorCount = errorCount
+    }
 
     func json(now: Date = Date()) -> [String: Any] {
         var resourceAttributes: [String: String] = [
@@ -88,15 +131,15 @@ public struct SessionMetaRow {
             "user_traits": [String: String](),
             "language": Locale.preferredLanguages.first ?? "",
             "last_activity_at": Self.clickHouseDateTime(now),
-            "click_count": 0,
-            "page_views": 0,
-            "error_count": 0,
+            "click_count": clickCount,
+            "page_views": pageViews,
+            "error_count": errorCount,
         ]
 
         if status == .ended {
             row["end_time"] = Self.clickHouseDateTime(now)
             row["duration_ms"] = max(0, Int(now.timeIntervalSince(startedAt) * 1000))
-            row["trace_ids"] = [String]()
+            row["trace_ids"] = traceIds
         }
         return row
     }

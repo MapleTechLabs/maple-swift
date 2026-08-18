@@ -1,4 +1,4 @@
-import MapleReplay
+import Maple
 import SwiftUI
 
 @main
@@ -10,10 +10,15 @@ struct ReplayDemoApp: App {
             ZStack(alignment: .bottom) {
                 TabView {
                     OrdersScreen()
+                        .mapleScreen("Orders")
                         .tabItem { Label("Orders", systemImage: "shippingbox") }
+                    NetworkScreen()
+                        .tabItem { Label("Network", systemImage: "network") }
                     SwiftUIScreen()
+                        .mapleScreen("SwiftUIShowcase")
                         .tabItem { Label("SwiftUI", systemImage: "swift") }
                     UIKitScreen()
+                        .mapleScreen("UIKitShowcase")
                         .tabItem { Label("UIKit", systemImage: "square.stack") }
                 }
 
@@ -90,8 +95,17 @@ final class RecorderController: ObservableObject {
         MapleReplay.shared.onSegment = { [weak self] artifact in
             self?.segments.append(artifact)
         }
-        MapleReplay.shared.start(
-            options: options, serviceName: "replay-demo", environment: "development"
+        var mapleOptions = MapleOptions()
+        mapleOptions.ingestKey = ingestKey
+        mapleOptions.endpoint = endpoint
+        mapleOptions.replay = options
+        // Left at the default (`nil`) so every host except the ingest endpoint gets a
+        // `traceparent` — which is what makes the demo's requests continue into the
+        // backend's traces without configuring anything.
+        mapleOptions.tracing.tracePropagationTargets = nil
+
+        Maple.start(
+            options: mapleOptions, serviceName: "replay-demo", environment: "development"
         )
         sessionId = MapleReplay.shared.sessionId
         isRecording = MapleReplay.shared.isRecording
@@ -100,7 +114,7 @@ final class RecorderController: ObservableObject {
 
     func stop() {
         guard isRecording else { return }
-        MapleReplay.shared.stop()
+        Maple.stop()
         isRecording = false
     }
 
