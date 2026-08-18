@@ -20,30 +20,51 @@ import Foundation
 /// the call that gets it right by default.
 public enum Maple {
     /// Start both. Refuses without a well-formed ingest key, loudly, in each subsystem.
+    ///
+    /// Anything left unset comes from `Info.plist` — see `MapleBundleConfiguration` for
+    /// the keys and how a build pipeline supplies them. With the plist configured this is
+    /// the whole integration:
+    ///
+    /// ```swift
+    /// Maple.start()
+    /// ```
+    ///
+    /// `serviceName` and `environment` are `nil` rather than defaulted so "not passed"
+    /// stays distinguishable from "passed the default" — otherwise a plist value could
+    /// never win, and configuring the pipeline would silently do nothing.
     @MainActor
     public static func start(
         options: MapleOptions = MapleOptions(),
-        serviceName: String = "ios-app",
+        serviceName: String? = nil,
         environment: String? = nil,
-        userId: String = ""
+        userId: String = "",
+        bundle: Bundle = .main
     ) {
+        var resolved = options
+        resolved.serviceName = serviceName ?? options.serviceName
+        resolved.environment = environment ?? options.environment
+        resolved = resolved.resolved(against: MapleBundleConfiguration.read(from: bundle))
+
+        let endpoint = resolved.endpoint ?? MapleOptions.defaultEndpoint
+        let service = resolved.serviceName ?? "ios-app"
+
         // Tracing first. The recorder publishes the session id on `start()`, and a tracer
         // that is not yet running when that happens would miss the spans of the first
         // screen — which on a cold launch is the most-watched part of any recording.
-        var tracing = options.tracing
-        tracing.ingestKey = options.ingestKey
-        tracing.endpoint = options.endpoint
-        tracing.serviceName = serviceName
-        tracing.environment = environment
+        var tracing = resolved.tracing
+        tracing.ingestKey = resolved.ingestKey
+        tracing.endpoint = endpoint
+        tracing.serviceName = service
+        tracing.environment = resolved.environment
         MapleTracing.shared.start(options: tracing)
 
-        var replay = options.replay
-        replay.ingestKey = options.ingestKey
-        replay.endpoint = options.endpoint
+        var replay = resolved.replay
+        replay.ingestKey = resolved.ingestKey
+        replay.endpoint = endpoint
         MapleReplay.shared.start(
             options: replay,
-            serviceName: serviceName,
-            environment: environment,
+            serviceName: service,
+            environment: resolved.environment,
             userId: userId
         )
     }

@@ -26,6 +26,77 @@ refuse to start without a well-formed key — assertion in debug, a log line and
 Work that can never be delivered costs the user battery and gains them nothing, and the 401 it
 would earn is invisible behind a transport whose whole job is to swallow failures.
 
+## Configuring a build
+
+Nothing has to be hardcoded. Leave `ingestKey`, `endpoint`, `serviceName` and `environment` unset
+and they come from `Info.plist`, so the whole integration is:
+
+```swift
+Maple.start()
+```
+
+Put the values in your `Info.plist` as build settings, which Xcode substitutes at build time:
+
+```xml
+<key>Maple</key>
+<dict>
+    <key>IngestKey</key>
+    <string>$(MAPLE_INGEST_KEY)</string>
+    <key>Endpoint</key>
+    <string>$(MAPLE_ENDPOINT)</string>
+    <key>Environment</key>
+    <string>$(MAPLE_ENVIRONMENT)</string>
+    <key>ServiceName</key>
+    <string>$(MAPLE_SERVICE_NAME)</string>
+</dict>
+```
+
+Then a pipeline sets them like any other build setting — no code change per environment:
+
+```bash
+# xcodebuild / Fastlane (xcargs:) / any CI
+xcodebuild archive -scheme MyApp \
+  MAPLE_INGEST_KEY="$MAPLE_INGEST_KEY" \
+  MAPLE_ENVIRONMENT=production
+```
+
+**Xcode Cloud**: define `MAPLE_INGEST_KEY` as an environment variable on the workflow (mark it
+secret) and add a `ci_post_clone.sh` that writes it into an `.xcconfig` the target already includes —
+Xcode Cloud environment variables reach scripts, not build settings, so the script is the bridge:
+
+```bash
+# ci_scripts/ci_post_clone.sh
+echo "MAPLE_INGEST_KEY = $MAPLE_INGEST_KEY" >> ../Config/Secrets.xcconfig
+```
+
+**Per-configuration** values are just `.xcconfig` files — `Debug.xcconfig` pointing at staging,
+`Release.xcconfig` at production — with no `#if DEBUG` anywhere in your code.
+
+`Examples/ReplayDemo` is wired exactly this way; see its `project.yml`.
+
+### Keys and precedence
+
+- **Values set in code win over the plist.** A value at the call site is a deliberate act by
+  someone reading the code in front of them; the plist is the deployment default.
+- Flat keys (`MapleIngestKey`, `MapleEnvironment`, …) work too, for apps that patch a plist in CI
+  rather than substituting build settings. The nested `Maple` dictionary wins if both are present.
+  Note that `INFOPLIST_KEY_<name>` build settings are *not* a way to set these: Xcode only honours
+  that prefix for keys it knows about, and drops the rest from the generated plist without warning.
+- An unsubstituted `$(MAPLE_INGEST_KEY)` surviving into the built plist means the build setting was
+  never defined. The SDK treats that as unset and logs it, rather than sending `Bearer $(…)` and
+  earning a 401 that a best-effort transport swallows.
+- `TracesSampleRate` reads from either a number or a string, because a substituted build setting is
+  always a string.
+
+The ingest key is the **public** `maple_pk_` one, which is designed to ship inside an app binary —
+it can only write telemetry. Still worth injecting from a CI secret rather than committing, so
+rotating it does not need a code change.
+
+`ProcessInfo.environment` is deliberately not consulted by the SDK. It is populated only when the
+app is launched by Xcode or `simctl`, so an SDK configured that way works on a developer's machine
+and is silently unconfigured in TestFlight. The demo layers env vars on top for its own local
+testing, which is the right place for that.
+
 ## Tracing
 
 ```

@@ -18,13 +18,31 @@ targets:
     dependencies:
       - package: Maple
         product: Maple
+    # A real Info.plist rather than GENERATE_INFOPLIST_FILE, because the SDK's settings
+    # have to live in it. `INFOPLIST_KEY_<name>` only works for the keys Xcode knows
+    # about — arbitrary ones are dropped from the generated plist without a warning.
+    #
+    # Xcode expands `$(…)` in plist values at build time, so these are ordinary build
+    # settings and a pipeline sets them like any other:
+    #
+    #   xcodebuild … MAPLE_INGEST_KEY=maple_pk_… MAPLE_ENVIRONMENT=production
+    info:
+      path: Info.plist
+      properties:
+        UILaunchScreen: {}
+        UIApplicationSupportsIndirectInputEvents: true
+        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
+        Maple:
+          IngestKey: $(MAPLE_INGEST_KEY)
+          Endpoint: $(MAPLE_ENDPOINT)
+          Environment: $(MAPLE_ENVIRONMENT)
+          ServiceName: $(MAPLE_SERVICE_NAME)
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.maple.ReplayDemo
-        GENERATE_INFOPLIST_FILE: YES
-        INFOPLIST_KEY_UILaunchScreen_Generation: YES
-        INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents: YES
-        INFOPLIST_KEY_UISupportedInterfaceOrientations: UIInterfaceOrientationPortrait
+        # Defaults for a local build; CI overrides them on the xcodebuild line.
+        MAPLE_ENVIRONMENT: development
+        MAPLE_SERVICE_NAME: replay-demo
         TARGETED_DEVICE_FAMILY: "1,2"
         SWIFT_VERSION: "5.0"
         CODE_SIGNING_REQUIRED: NO

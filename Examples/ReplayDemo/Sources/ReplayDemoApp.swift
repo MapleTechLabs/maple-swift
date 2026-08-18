@@ -51,30 +51,35 @@ final class RecorderController: ObservableObject {
     @Published private(set) var segments: [SegmentArtifacts] = []
     @Published private(set) var sessionId: String?
 
-    /// Ingest target, overridable at launch so the demo can be pointed at a local
-    /// gateway without an edit-and-rebuild cycle:
+    /// Ingest target.
+    ///
+    /// A shipped app is configured from `Info.plist`, which this target fills from build
+    /// settings (see `project.yml`) — that is what a deploy pipeline sets, and leaving
+    /// these `nil` is what lets the SDK read them.
+    ///
+    /// The environment variables are a *development* override on top, because
+    /// `ProcessInfo.environment` is populated only by Xcode and `simctl` and so exists
+    /// nowhere a real user runs the app:
     ///
     /// ```
-    /// MAPLE_ENDPOINT=http://127.0.0.1:3475 MAPLE_INGEST_KEY=maple_pk_… <run the app>
+    /// SIMCTL_CHILD_MAPLE_ENDPOINT=http://127.0.0.1:3475 \
+    /// SIMCTL_CHILD_MAPLE_INGEST_KEY=maple_pk_… xcrun simctl launch booted dev.maple.ReplayDemo
     /// ```
     ///
     /// `MAPLE_TEST` is the gateway's sentinel key: it authenticates, and everything sent
     /// under it is accepted and discarded.
-    private var endpoint: URL {
-        ProcessInfo.processInfo.environment["MAPLE_ENDPOINT"]
-            .flatMap(URL.init(string:)) ?? URL(string: "https://ingest.maple.dev")!
+    private var endpoint: URL? {
+        ProcessInfo.processInfo.environment["MAPLE_ENDPOINT"].flatMap(URL.init(string:))
     }
 
-    private var ingestKey: String {
-        ProcessInfo.processInfo.environment["MAPLE_INGEST_KEY"] ?? "MAPLE_TEST"
+    private var ingestKey: String? {
+        ProcessInfo.processInfo.environment["MAPLE_INGEST_KEY"]
     }
 
     var options: ReplayOptions {
         var options = ReplayOptions()
         options.quality = quality
         options.flushPolicy = mode == .continuous ? .defaultContinuous : .defaultBuffered
-        options.ingestKey = ingestKey
-        options.endpoint = endpoint
         // The demo is the surface these get inspected on, so keep the disk copy: the
         // chunk on disk is byte-for-byte the body that was POSTed.
         options.writeSegmentsToDisk = true
@@ -96,6 +101,8 @@ final class RecorderController: ObservableObject {
             self?.segments.append(artifact)
         }
         var mapleOptions = MapleOptions()
+        // Both `nil` unless overridden for development, so the values from Info.plist
+        // win — which is the path a real build takes.
         mapleOptions.ingestKey = ingestKey
         mapleOptions.endpoint = endpoint
         mapleOptions.replay = options
@@ -104,12 +111,19 @@ final class RecorderController: ObservableObject {
         // backend's traces without configuring anything.
         mapleOptions.tracing.tracePropagationTargets = nil
 
-        Maple.start(
-            options: mapleOptions, serviceName: "replay-demo", environment: "development"
-        )
+        // No serviceName or environment here on purpose: they come from Info.plist, so
+        // this call is what a host app with a configured pipeline actually writes.
+        Maple.start(options: mapleOptions)
         sessionId = MapleReplay.shared.sessionId
         isRecording = MapleReplay.shared.isRecording
-        print("[ReplayDemo] endpoint=\(endpoint.absoluteString) session=\(sessionId ?? "none")")
+        let plist = MapleBundleConfiguration.read()
+        let effectiveEndpoint = endpoint ?? plist.endpoint ?? MapleOptions.defaultEndpoint
+        let hasKey = (ingestKey ?? plist.ingestKey) != nil
+        print("""
+        [ReplayDemo] endpoint=\(effectiveEndpoint.absoluteString) \
+        service=\(plist.serviceName ?? "<unset>") env=\(plist.environment ?? "<unset>") \
+        key=\(hasKey ? "set" : "MISSING") session=\(sessionId ?? "none")
+        """)
     }
 
     func stop() {
