@@ -45,6 +45,10 @@ final class MapleURLProtocol: URLProtocol {
 
     private var relayTask: URLSessionTask?
     private var span: Span?
+    /// Arrives in `didFinishCollecting`, which `URLSession` delivers before
+    /// `didCompleteWithError` — so it is always here in time to be written onto the span
+    /// `relayFinished` is about to close.
+    private var metrics: TransactionMetrics?
 
     override class func canInit(with request: URLRequest) -> Bool {
         guard property(forKey: handledKey, in: request) == nil else { return false }
@@ -96,8 +100,15 @@ final class MapleURLProtocol: URLProtocol {
         client?.urlProtocol(self, didLoad: data)
     }
 
+    fileprivate func relayCollected(_ metrics: URLSessionTaskMetrics) {
+        self.metrics = TransactionMetrics(metrics)
+    }
+
     fileprivate func relayFinished(response: URLResponse?, error: Error?) {
         if let span {
+            // Before `finish`, which ends the span: an attribute set after `end` is lost.
+            metrics?.apply(to: span)
+            metrics = nil
             URLSessionInstrumentation.finish(span: span, response: response, error: error, request: request)
             self.span = nil
         }
@@ -148,6 +159,14 @@ private final class RelayDelegate: NSObject, URLSessionDataDelegate {
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
         handler(for: dataTask)?.relayReceived(data: data)
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        didFinishCollecting metrics: URLSessionTaskMetrics
+    ) {
+        handler(for: task)?.relayCollected(metrics)
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
