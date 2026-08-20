@@ -23,9 +23,18 @@ enum ViewCapture {
         let bounds = window.bounds
         guard bounds.width > 0, bounds.height > 0 else { return nil }
 
-        // Flush any pending layout before doing anything else, so the bitmap and the
-        // redaction rects describe the same layout state. See the ordering note below.
-        window.layoutIfNeeded()
+        // Scan *before* drawing, and do nothing in between that could move a view.
+        //
+        // `capture` runs as its own main-thread turn — the recorder's timer hops here
+        // via `DispatchQueue.main.async` — so the previous run loop's CATransaction has
+        // already committed. The tree walked here and the frame the render server holds
+        // are therefore the same layout state, which is what lets the draw below be
+        // cheap. Nothing between this line and the draw may force a layout pass.
+        //
+        // In particular, *not* `window.layoutIfNeeded()`, which used to run here. It
+        // applies pending layout to the view tree without committing it to the render
+        // server, which is exactly how the two fall out of step — see the draw below.
+        let redactions = RedactionScanner(options: options).rects(in: window)
 
         let format = UIGraphicsImageRendererFormat()
         // Rasterise at the tier's scale, not at the device's. Capturing above the tier
@@ -46,25 +55,26 @@ enum ViewCapture {
             // ships blank rectangles where sensitive content was — and looks correct
             // in a UIKit-only test app.
             //
-            // `afterScreenUpdates: true` is mandatory, not a quality dial.
+            // `afterScreenUpdates: false`, because `true` is visible to the user.
             //
-            // With `false`, UIKit returns the *previously committed* frame while the
-            // redaction rects are computed from the *current* view tree. Any layout
-            // change between those two states puts the masks in the wrong place — and a
-            // mask in the wrong place means the text it was meant to cover is now
-            // visible in the recording. This was observed: a status line that grew by a
-            // row left its own text exposed and painted the redaction below it.
+            // `true` forces UIKit to commit and re-render the entire window off-screen,
+            // synchronously, before it draws. Once per second on the live key window,
+            // that reads as a full-screen flash — the app looked like it was flickering
+            // constantly, and it was this line.
             //
-            // The synchronous render costs a few milliseconds. At 1 fps that is an
-            // irrelevant fraction of a second, and it is the difference between a
-            // correct recording and one that leaks whatever moved.
-            window.drawHierarchy(in: bounds, afterScreenUpdates: true)
+            // This carried a comment claiming `true` was mandatory: with `false` UIKit
+            // returns the previously committed frame while the redaction rects come from
+            // the current view tree, so a layout change between them leaves a mask in the
+            // wrong place and exposes the text it was meant to cover. That skew was real,
+            // but `layoutIfNeeded()` above was manufacturing it — it moved the tree ahead
+            // of the committed frame on every capture. With it gone the two agree, and
+            // `false` is both correct and invisible.
+            //
+            // This is what every mobile replay recorder does; sentry-cocoa's
+            // `SentryDefaultViewRenderer` and `SentryViewRendererV2` both pass `false`
+            // unconditionally, and neither calls `layoutIfNeeded` or `CATransaction.flush`.
+            window.drawHierarchy(in: bounds, afterScreenUpdates: false)
         }
-
-        // Scan *after* drawing. `drawHierarchy` commits pending updates, so the tree we
-        // walk now is exactly the tree that was rasterised above — no layout pass can
-        // intervene, because this whole function is synchronous on the main thread.
-        let redactions = RedactionScanner(options: options).rects(in: window)
 
         return PendingFrame(image: image, redactions: redactions, timestamp: Date())
     }
