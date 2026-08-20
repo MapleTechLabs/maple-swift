@@ -133,6 +133,35 @@ final class RedactionScannerTests: XCTestCase {
         XCTAssertTrue(scan(container).isEmpty)
     }
 
+    /// Unmasking is matched by exact type, so it cannot reach a class nobody named.
+    ///
+    /// `isKind(of:)` here would make one entry an app-wide exemption: unmask `UILabel` to
+    /// show a price tag and every label subclass in the app is exposed with it, including
+    /// the ones that exist precisely because their content is sensitive. Masking keeps
+    /// subclass matching — over-masking a subclass is safe, unmasking one is not.
+    func testUnmaskingASuperclassDoesNotExposeItsSubclasses() {
+        final class AccountNumberLabel: UILabel {}
+        options.unmaskedViewClasses = [UILabel.self]
+        let container = root()
+        container.addSubview(UILabel(frame: CGRect(x: 0, y: 0, width: 100, height: 20)))
+        container.addSubview(AccountNumberLabel(frame: CGRect(x: 0, y: 40, width: 100, height: 20)))
+
+        XCTAssertEqual(scan(container), [CGRect(x: 0, y: 40, width: 100, height: 20)])
+    }
+
+    /// The counterpart: masking a base class still covers everything beneath it.
+    func testMaskingASuperclassCoversItsSubclasses() {
+        class Chart: UIView {}
+        final class BarChart: Chart {}
+        options.maskedViewClasses = [Chart.self]
+        let container = root()
+        let chart = BarChart(frame: CGRect(x: 0, y: 0, width: 100, height: 100))
+        chart.addSubview(UIView(frame: .zero))
+        container.addSubview(chart)
+
+        XCTAssertEqual(scan(container), [CGRect(x: 0, y: 0, width: 100, height: 100)])
+    }
+
     func testMaskedViewClassesForceMasking() {
         final class CustomChart: UIView {}
         options.maskedViewClasses = [CustomChart.self]
@@ -229,6 +258,102 @@ final class RedactionScannerTests: XCTestCase {
         container.addSubview(UILabel(frame: CGRect(x: 0, y: 200, width: 100, height: 50)))
 
         XCTAssertEqual(scan(container).count, 2)
+    }
+
+    // MARK: - Clipping
+
+    /// A row scrolled half out of an inset table must not mask the header above it.
+    ///
+    /// This is the everyday over-mask, not an edge case: any partially scrolled cell in a
+    /// scroll view that does not fill the screen spills its rect over whatever sits above
+    /// or below. The cell is real, its rect in root space is real, and the part of it
+    /// outside the table is not on the captured frame at all.
+    func testRectIsTrimmedToAClippingAncestor() {
+        let container = root()
+        let header = UILabel(frame: CGRect(x: 0, y: 0, width: 400, height: 200))
+        container.addSubview(header)
+
+        let table = UIScrollView(frame: CGRect(x: 0, y: 200, width: 400, height: 400))
+        // Default for UIScrollView, stated so the test says what it depends on.
+        table.clipsToBounds = true
+        let row = UILabel(frame: CGRect(x: 0, y: -50, width: 400, height: 100))
+        table.addSubview(row)
+        container.addSubview(table)
+
+        // The row occupies 150..250 in root space; only 200..250 is inside the table.
+        // Untrimmed, its rect would black out the bottom quarter of the header.
+        XCTAssertEqual(scan(container), [
+            CGRect(x: 0, y: 0, width: 400, height: 200),
+            CGRect(x: 0, y: 200, width: 400, height: 50),
+        ])
+    }
+
+    /// Content scrolled entirely out of view produces no rect at all.
+    ///
+    /// Recycled cells linger in the hierarchy at coordinates well outside their scroll
+    /// view. Painting those is not merely wasted work — the rects land on unrelated
+    /// content, or on nothing.
+    func testFullyClippedContentProducesNoRect() {
+        let container = root()
+        let scrollView = UIScrollView(frame: CGRect(x: 0, y: 300, width: 400, height: 200))
+        scrollView.addSubview(UILabel(frame: CGRect(x: 0, y: -400, width: 400, height: 100)))
+        container.addSubview(scrollView)
+
+        XCTAssertTrue(scan(container).isEmpty)
+    }
+
+    /// Clipping follows `clipsToBounds`, not containment: UIKit draws a subview outside a
+    /// non-clipping parent, so trimming to every parent's frame would erase real masks.
+    func testNonClippingParentDoesNotTrimItsChild() {
+        let container = root()
+        let card = UIView(frame: CGRect(x: 100, y: 100, width: 100, height: 100))
+        card.clipsToBounds = false
+        // A badge hanging off the corner, the usual reason a parent doesn't clip.
+        card.addSubview(UILabel(frame: CGRect(x: 80, y: -10, width: 60, height: 20)))
+        container.addSubview(card)
+
+        XCTAssertEqual(scan(container), [CGRect(x: 180, y: 90, width: 60, height: 20)])
+    }
+
+    /// Clipping composes down the tree: the innermost clipping ancestor does not undo a
+    /// tighter one further up.
+    func testClipsAccumulateAcrossNestedClippingAncestors() {
+        let container = root()
+        let outer = UIView(frame: CGRect(x: 0, y: 0, width: 400, height: 300))
+        outer.clipsToBounds = true
+        let inner = UIView(frame: CGRect(x: 0, y: 0, width: 400, height: 500))
+        inner.clipsToBounds = true
+        inner.addSubview(UILabel(frame: CGRect(x: 0, y: 250, width: 400, height: 200)))
+        outer.addSubview(inner)
+        container.addSubview(outer)
+
+        // The label spans 250..450; `inner` allows all of it, `outer` cuts it at 300.
+        XCTAssertEqual(scan(container), [CGRect(x: 0, y: 250, width: 400, height: 50)])
+    }
+
+    /// Nothing outside the captured frame is worth a rect — the capture is the root's
+    /// bounds, so the root is the outermost clip whether or not it clips its subviews.
+    func testRectIsTrimmedToTheRootBounds() {
+        let container = root()
+        container.clipsToBounds = false
+        container.addSubview(UILabel(frame: CGRect(x: 300, y: 700, width: 400, height: 400)))
+
+        XCTAssertEqual(scan(container), [CGRect(x: 300, y: 700, width: 100, height: 100)])
+    }
+
+    /// Trimming must not become a way to lose a mask: a clipped rect still covers every
+    /// pixel of the view that was actually drawn.
+    func testTrimmingNeverUncoversDrawnContent() {
+        let container = root()
+        let clipper = UIView(frame: CGRect(x: 50, y: 50, width: 200, height: 200))
+        clipper.clipsToBounds = true
+        let label = UILabel(frame: CGRect(x: -25, y: -25, width: 300, height: 300))
+        clipper.addSubview(label)
+        container.addSubview(clipper)
+
+        let drawn = label.convert(label.bounds, to: container)
+            .intersection(clipper.convert(clipper.bounds, to: container))
+        XCTAssertEqual(scan(container), [drawn])
     }
 
     func testMaskedParentSuppressesDescendantScanning() {

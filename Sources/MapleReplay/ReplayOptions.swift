@@ -107,9 +107,14 @@ public struct ReplayOptions: Sendable {
     public var maskAllImages: Bool = true
 
     /// Views of these classes are always redacted, on top of the rules above.
+    /// Matched including subclasses — masking a base class masks everything under it.
     public var maskedViewClasses: [AnyClass] = []
 
     /// Views of these classes are never redacted. The only way to opt out.
+    ///
+    /// Matched by **exact type**, unlike `maskedViewClasses`. Listing `UILabel` here
+    /// unmasks `UILabel` and nothing else; it does not quietly expose every label
+    /// subclass in the app. Name the class you mean.
     public var unmaskedViewClasses: [AnyClass] = []
 
     /// Draw the redaction rects on screen instead of only into captured frames.

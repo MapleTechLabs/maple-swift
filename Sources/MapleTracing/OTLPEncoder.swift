@@ -142,5 +142,5 @@ enum OTLPEncoder {
 }
 
 enum MapleTracingVersion {
-    static let current = "0.3.0"
+    static let current = "0.3.2"
 }

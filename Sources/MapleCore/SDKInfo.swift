@@ -8,7 +8,7 @@ import Foundation
 /// column, rather than the two being told apart by guessing from `os_name`.
 public enum MapleSDK {
     public static let name = "maple-swift"
-    public static let version = "0.3.0"
+    public static let version = "0.3.2"
 
     /// The `x-maple-sdk` header name and value.
     public static let hintHeader = "x-maple-sdk"

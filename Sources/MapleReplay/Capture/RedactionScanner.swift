@@ -16,6 +16,11 @@ import UIKit
 /// your UI was. We render a redaction rect over content that may not have needed one —
 /// degraded, but never leaking. That asymmetry is the whole reason this design survives
 /// iOS releases without maintenance.
+///
+/// The price of that asymmetry is over-masking, and the one reduction that is free of it
+/// is clipping: a rect is trimmed to the region its view was allowed to draw in. Trimming
+/// never uncovers anything — the pixels removed were never the view's to paint — and
+/// without it a half-scrolled row masks the header above its table.
 struct RedactionScanner {
     let options: ReplayOptions
 
@@ -41,7 +46,9 @@ struct RedactionScanner {
     /// being an unrecognised leaf, would mask the entire screen.
     func rects(in root: UIView, excluding: UIView? = nil) -> [CGRect] {
         var result: [CGRect] = []
-        scan(root, root: root, excluding: excluding, into: &result)
+        // The capture is the root's bounds, so that is the outermost clip. Anything
+        // outside it was never rasterised and a rect over it can only mask other content.
+        scan(root, root: root, excluding: excluding, clip: root.bounds, into: &result)
         return merge(result)
     }
 
@@ -53,19 +60,19 @@ struct RedactionScanner {
     /// it came from the label you expected or from its grandparent.
     func debugRects(in root: UIView, excluding: UIView? = nil) -> [(name: String, rect: CGRect)] {
         var result: [(String, CGRect)] = []
-        debugScan(root, root: root, excluding: excluding, into: &result)
+        debugScan(root, root: root, excluding: excluding, clip: root.bounds, into: &result)
         return result.map { (name: $0.0, rect: $0.1) }
     }
 
     private func debugScan(
-        _ view: UIView, root: UIView, excluding: UIView?, into result: inout [(String, CGRect)]
+        _ view: UIView, root: UIView, excluding: UIView?, clip: CGRect,
+        into result: inout [(String, CGRect)]
     ) {
         guard view !== excluding, !(view is MaskingPreviewView) else { return }
         guard !view.isHidden, view.alpha > 0.01 else { return }
-        if isMember(view, ofAny: options.unmaskedViewClasses) { return }
+        if isExplicitlyUnmasked(view) { return }
 
-        let visible = view.convert(view.bounds, to: root)
-        guard !visible.isNull, visible.width > 0, visible.height > 0 else { return }
+        guard let visible = clipped(view.convert(view.bounds, to: root), to: clip) else { return }
 
         if shouldMask(view) {
             result.append((NSStringFromClass(type(of: view)), visible))
@@ -73,16 +80,19 @@ struct RedactionScanner {
         }
         // Layer-level content is attributed to its owning view, so a diagnostic dump
         // accounts for every rect the real scan produces.
+        let subtreeClip = view.clipsToBounds ? visible : clip
         let owner = NSStringFromClass(type(of: view))
-        for rect in contentLayerRects(of: view, root: root) {
+        for rect in contentLayerRects(of: view, root: root, clip: subtreeClip) {
             result.append(("\(owner)→layer", rect))
         }
         for subview in view.subviews {
-            debugScan(subview, root: root, excluding: excluding, into: &result)
+            debugScan(subview, root: root, excluding: excluding, clip: subtreeClip, into: &result)
         }
     }
 
-    private func scan(_ view: UIView, root: UIView, excluding: UIView?, into result: inout [CGRect]) {
+    private func scan(
+        _ view: UIView, root: UIView, excluding: UIView?, clip: CGRect, into result: inout [CGRect]
+    ) {
         guard view !== excluding else { return }
         // The debug overlay is an unrecognised leaf, so the unknown-leaf rule would have
         // it mask the entire screen the moment it is switched on.
@@ -91,10 +101,12 @@ struct RedactionScanner {
 
         // An explicit unmask opt-out wins over everything, including the unknown-leaf rule.
         // This is the single escape hatch, and it is deliberately the only one.
-        if isMember(view, ofAny: options.unmaskedViewClasses) { return }
+        if isExplicitlyUnmasked(view) { return }
 
-        let visible = view.convert(view.bounds, to: root)
-        guard !visible.isNull, visible.width > 0, visible.height > 0 else { return }
+        // `clip` is the intersection of every clipping ancestor's bounds — the region this
+        // view can actually appear in. A rect outside it covers content the view does not
+        // draw, and a view entirely outside it is not on the captured frame at all.
+        guard let visible = clipped(view.convert(view.bounds, to: root), to: clip) else { return }
 
         if shouldMask(view) {
             result.append(visible)
@@ -115,20 +127,52 @@ struct RedactionScanner {
         // string from a rendered image and must treat the whole category as text.
         // A consequence worth stating plainly: SwiftUI-drawn images are covered by
         // `maskAllText`, not by `maskAllImages`, which only reaches `UIImageView`.
+
+        // A view that clips narrows the clip for everything beneath it — its own drawing
+        // layers included. A view that does not clip passes the ancestors' clip through
+        // unchanged, because UIKit draws subviews outside a non-clipping parent's bounds.
+        let subtreeClip = view.clipsToBounds ? visible : clip
+
         if options.maskAllText {
-            result.append(contentsOf: contentLayerRects(of: view, root: root))
+            result.append(contentsOf: contentLayerRects(of: view, root: root, clip: subtreeClip))
         }
 
         for subview in view.subviews {
-            scan(subview, root: root, excluding: excluding, into: &result)
+            scan(subview, root: root, excluding: excluding, clip: subtreeClip, into: &result)
         }
+    }
+
+    /// `rect` reduced to the part of it that is inside `clip`, or nil if none of it is.
+    ///
+    /// Every rect this scanner emits goes through here. Clipping can only ever shrink or
+    /// drop a rect, never move or grow one, so it cannot uncover anything: a pixel removed
+    /// from a mask is a pixel the masked view was not allowed to draw on.
+    private func clipped(_ rect: CGRect, to clip: CGRect) -> CGRect? {
+        guard !rect.isNull, !rect.isInfinite else { return nil }
+        let visible = rect.intersection(clip)
+        guard !visible.isNull, visible.width > 0, visible.height > 0 else { return nil }
+        return visible
+    }
+
+    /// Whether this view is named in `unmaskedViewClasses`, matched by exact type.
+    ///
+    /// Exact type, not `isKind(of:)`, and the asymmetry with `maskedViewClasses` is the
+    /// point. Masking a superclass over-masks its subclasses, which is safe. *Unmasking* a
+    /// superclass silently unmasks every subclass of it in the app — put `UILabel` in this
+    /// list to expose one price tag and the account-number label two screens over is
+    /// exposed with it, without ever being named. An escape hatch has to be narrow enough
+    /// that using it is a decision about the class you actually wrote down.
+    private func isExplicitlyUnmasked(_ view: UIView) -> Bool {
+        guard !options.unmaskedViewClasses.isEmpty else { return false }
+        let viewType = ObjectIdentifier(type(of: view))
+        return options.unmaskedViewClasses.contains { ObjectIdentifier($0) == viewType }
     }
 
     /// Rects of content-bearing layers owned by `view` itself.
     ///
     /// Subviews' layers are excluded — they are reached by the view walk, which can apply
     /// the full masking rules to them. Only layers with no owning view are handled here.
-    private func contentLayerRects(of view: UIView, root: UIView) -> [CGRect] {
+    private func contentLayerRects(of view: UIView, root: UIView, clip: CGRect) -> [CGRect] {
         guard let sublayers = view.layer.sublayers, !sublayers.isEmpty else { return [] }
         // Subviews' layers are sublayers of their superview's layer. Skip them at any
         // depth — the view walk reaches them and can apply the full masking rules;
@@ -137,7 +181,9 @@ struct RedactionScanner {
 
         var result: [CGRect] = []
         for layer in sublayers {
-            collectContentLayers(layer, root: root, skipping: subviewLayers, into: &result)
+            collectContentLayers(
+                layer, root: root, skipping: subviewLayers, clip: clip, into: &result
+            )
         }
         return result
     }
@@ -146,6 +192,7 @@ struct RedactionScanner {
         _ layer: CALayer,
         root: UIView,
         skipping subviewLayers: Set<ObjectIdentifier>,
+        clip: CGRect,
         into result: inout [CGRect]
     ) {
         guard !subviewLayers.contains(ObjectIdentifier(layer)) else { return }
@@ -156,6 +203,12 @@ struct RedactionScanner {
 
         let sublayers = layer.sublayers ?? []
 
+        // The layer-tree counterpart of `clipsToBounds`, and it is not redundant with it:
+        // SwiftUI's drawing layers are routinely laid out beyond the bounds of the layer
+        // that masks them, so a rect taken from one alone can spill well outside the view.
+        let bounds = layer.convert(layer.bounds, to: root.layer)
+        let subtreeClip = layer.masksToBounds ? bounds.intersection(clip) : clip
+
         // A layer with children and no bitmap of its own is a compositing container —
         // UIKit's `_UIMultiLayer`, SwiftUI's grouping layers. Descend into it rather than
         // masking it: a container's bounds span everything beneath it, so treating one as
@@ -163,14 +216,15 @@ struct RedactionScanner {
         // `UITransitionView`'s `_UIMultiLayer`.
         if layer.contents == nil, !sublayers.isEmpty {
             for sublayer in sublayers {
-                collectContentLayers(sublayer, root: root, skipping: subviewLayers, into: &result)
+                collectContentLayers(
+                    sublayer, root: root, skipping: subviewLayers, clip: subtreeClip, into: &result
+                )
             }
             return
         }
 
-        if isContentBearing(layer) {
-            let rect = layer.convert(layer.bounds, to: root.layer)
-            if rect.width > 0, rect.height > 0 { result.append(rect) }
+        if isContentBearing(layer), let visible = clipped(bounds, to: clip) {
+            result.append(visible)
         }
     }
 
@@ -296,6 +350,9 @@ struct RedactionScanner {
         return image.isSymbolImage || image.renderingMode == .alwaysTemplate
     }
 
+    /// Class membership in the *masking* direction, subclasses included.
+    ///
+    /// `isKind(of:)` is right here and wrong for unmasking — see `isExplicitlyUnmasked`.
     private func isMember(_ view: UIView, ofAny classes: [AnyClass]) -> Bool {
         classes.contains { view.isKind(of: $0) }
     }
