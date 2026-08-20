@@ -75,6 +75,9 @@ public final class SessionSink: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         sessionId = newId
         guard let newId else { return }
+        // Survives the process, so a crash reported on the next launch can name the
+        // session that produced it.
+        LastSessionStore.remember(newId)
         if states[newId] == nil {
             states[newId] = SessionState()
             order.append(newId)

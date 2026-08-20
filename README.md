@@ -311,6 +311,55 @@ crash during recovery still counts. Set `crashRecovery = false` to turn all of i
 Touch events are not recovered: they only ever lived in memory, so a recovered segment is video
 and timing only.
 
+## Crashes
+
+A crash reaches Maple's `/errors` as an ordinary span: `Error` status, plus an OTel `exception`
+event carrying `exception.type`, `.message` and `.stacktrace`. Nothing about the error pipeline is
+iOS-specific, and nothing had to be added to it — the same contract the web SDK's errors arrive on.
+
+```swift
+options.reportCrashes = true   // the default
+```
+
+The source is **MetricKit**, not a signal handler or `NSSetUncaughtExceptionHandler`. This SDK ships
+inside your app: installing a signal handler means running async-signal-unsafe code in a process
+that is already dying, and taking a slot whatever crash reporter you already have wants too. The OS
+captures the crash instead and hands it over on a later launch.
+
+The cost is latency. A payload can arrive up to 24 hours after the crash, so this answers *what is
+broken in this release*, not *what is broken right now*. Payloads are written to disk the moment
+they arrive, because MetricKit delivers each one exactly once and a launch that drops one never
+sees it again.
+
+The crash span carries the session id of the run that **crashed**, so it resolves to the recording
+recovered from that run — the seconds before the crash, in video. It also reports the `service.version`
+that crashed rather than the one now running, which is usually the update that fixed it.
+
+### Unsymbolicated, and what that costs
+
+MetricKit gives binary names, UUIDs and text-segment offsets. It does not give function names: those
+live in a dSYM that never leaves your build machine. So a frame reads
+
+```
+0   MyApp   0x104a2c1f0   +0x1d0f0
+```
+
+Maple groups those frames by binary, not by function, because the offset is rendered in hex and its
+fingerprint deliberately redacts hex runs. That is coarser than a backend stack trace — but an
+offset moves with any code change above it, so keying on it would split every crash into a fresh
+issue on every build. Grouping by binary is stable across releases. Upload dSYMs and the same slot
+fills with function names.
+
+Non-fatal errors do not need any of this. Record one on the span you are already inside:
+
+```swift
+span.recordError(error)                                   // a caught Swift error
+span.recordException(type: "PaymentDeclined", message: …) // or name it yourself
+```
+
+Both set `Error` status *and* add the event, because Maple needs the pair — an `exception` event on
+an `Ok` span produces no error row at all.
+
 ## Quality tiers
 
 A tier is a multiple of the window's own size in points, not an absolute pixel cap:
@@ -403,6 +452,9 @@ Known gaps in tracing, all deliberate:
 
 - A **crash-recovered** `ended` row cannot carry that session's trace ids. The sink died with the
   process, and the row is written on the next launch.
+- **Crash stacks are unsymbolicated** — no dSYM upload yet, so frames are binary + offset and
+  grouping is by binary rather than by function.
+- MetricKit delivers nothing on the **simulator**. Crash reporting needs a device.
 - **Upload tasks with a body stream** are not traced (see above).
 - `identify()` is not wired to spans yet: `user.id` is stamped by the browser SDK, and the mobile
   metadata row still sends the identity columns empty.

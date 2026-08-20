@@ -20,7 +20,9 @@ final class OTLPEncodingTests: XCTestCase {
     private func makeSpan(
         status: SpanStatus = .unset,
         attributes: [String: AttributeValue] = [:],
-        parent: SpanID? = SpanID.random()
+        parent: SpanID? = SpanID.random(),
+        events: [SpanEvent] = [],
+        resourceOverrides: [String: AttributeValue] = [:]
     ) -> SpanData {
         let start = Date(timeIntervalSince1970: 1_755_000_000.123456)
         return SpanData(
@@ -31,8 +33,23 @@ final class OTLPEncodingTests: XCTestCase {
             startTime: start,
             endTime: start.addingTimeInterval(0.25),
             attributes: attributes,
-            status: status
+            status: status,
+            events: events,
+            resourceOverrides: resourceOverrides
         )
+    }
+
+    private func resourceGroups(_ payload: [String: Any]) throws -> [[String: Any]] {
+        try XCTUnwrap(payload["resourceSpans"] as? [[String: Any]])
+    }
+
+    private func resourceAttributes(_ group: [String: Any]) throws -> [String: Any] {
+        let resource = try XCTUnwrap(group["resource"] as? [String: Any])
+        let attributes = try XCTUnwrap(resource["attributes"] as? [[String: Any]])
+        return Dictionary(uniqueKeysWithValues: attributes.map { entry in
+            let value = entry["value"] as? [String: Any]
+            return (entry["key"] as! String, value?["stringValue"] ?? value as Any)
+        })
     }
 
     func testTimestampsAreDecimalStrings() throws {
@@ -123,5 +140,97 @@ final class OTLPEncodingTests: XCTestCase {
         XCTAssertEqual(resource["maple.sdk.type"], .string("ios"))
         // Never a resource attribute: sessions rotate under a fixed resource.
         XCTAssertNil(resource["session.id"])
+    }
+
+    // MARK: - Events
+
+    func testSpanWithoutEventsOmitsTheKey() throws {
+        let span = try onlySpan(try encode([makeSpan()]))
+        XCTAssertNil(span["events"])
+    }
+
+    func testExceptionEventEncoding() throws {
+        let at = Date(timeIntervalSince1970: 1_755_000_000.5)
+        let span = try onlySpan(try encode([makeSpan(
+            status: .error("EXC_BAD_ACCESS (SIGSEGV)"),
+            events: [ExceptionSemantics.event(
+                type: "EXC_BAD_ACCESS",
+                message: "EXC_BAD_ACCESS (SIGSEGV)",
+                stacktrace: "0   MyApp   0x104a2c1f0",
+                timestamp: at
+            )]
+        )]))
+
+        let events = try XCTUnwrap(span["events"] as? [[String: Any]])
+        XCTAssertEqual(events.count, 1)
+        XCTAssertEqual(events[0]["name"] as? String, "exception")
+        // Same 64-bit rule as the span's own timestamps: a decimal string, not a number.
+        let time = try XCTUnwrap(events[0]["timeUnixNano"] as? String)
+        XCTAssertEqual(time, OTLPEncoder.nanoseconds(at))
+
+        let attributes = try XCTUnwrap(events[0]["attributes"] as? [[String: Any]])
+        let byKey = Dictionary(uniqueKeysWithValues: attributes.map {
+            ($0["key"] as! String, ($0["value"] as! [String: Any])["stringValue"] as! String)
+        })
+        XCTAssertEqual(byKey["exception.type"], "EXC_BAD_ACCESS")
+        XCTAssertEqual(byKey["exception.message"], "EXC_BAD_ACCESS (SIGSEGV)")
+        XCTAssertEqual(byKey["exception.stacktrace"], "0   MyApp   0x104a2c1f0")
+
+        // The MV keys on Error status AND the event; encoding one without the other
+        // produces no error row at all.
+        let status = try XCTUnwrap(span["status"] as? [String: Any])
+        XCTAssertEqual(status["code"] as? Int, 2)
+    }
+
+    func testExceptionEventOmitsEmptyStacktrace() throws {
+        let event = ExceptionSemantics.event(
+            type: "T", message: "m", stacktrace: nil, timestamp: Date()
+        )
+        XCTAssertNil(event.attributes["exception.stacktrace"])
+    }
+
+    // MARK: - Resource overrides
+
+    func testSpansWithoutOverridesStayInOneGroup() throws {
+        let payload = try encode([makeSpan(), makeSpan()], resource: ["service.name": .string("app")])
+        let groups = try resourceGroups(payload)
+        XCTAssertEqual(groups.count, 1)
+    }
+
+    func testOverrideSplitsGroupsAndMergesOntoTheBaseResource() throws {
+        let base: [String: AttributeValue] = [
+            "service.name": .string("ios-app"),
+            "service.version": .string("2.0.0"),
+            "deployment.environment": .string("production"),
+        ]
+        let payload = try encode(
+            [makeSpan(), makeSpan(resourceOverrides: ["service.version": .string("1.4.2")])],
+            resource: base
+        )
+
+        let groups = try resourceGroups(payload)
+        XCTAssertEqual(groups.count, 2)
+
+        let live = try resourceAttributes(groups[0])
+        XCTAssertEqual(live["service.version"] as? String, "2.0.0")
+
+        let crash = try resourceAttributes(groups[1])
+        XCTAssertEqual(crash["service.version"] as? String, "1.4.2")
+        // The merged resource, not the diff — a group restating only the override would
+        // lose the environment and the service name the warehouse reads off it.
+        XCTAssertEqual(crash["service.name"] as? String, "ios-app")
+        XCTAssertEqual(crash["deployment.environment"] as? String, "production")
+    }
+
+    func testSpansSharingAnOverrideShareAGroup() throws {
+        let override: [String: AttributeValue] = ["service.version": .string("1.4.2")]
+        let payload = try encode(
+            [makeSpan(resourceOverrides: override), makeSpan(resourceOverrides: override)],
+            resource: ["service.name": .string("app")]
+        )
+        let groups = try resourceGroups(payload)
+        XCTAssertEqual(groups.count, 1)
+        let scopeSpans = try XCTUnwrap(groups[0]["scopeSpans"] as? [[String: Any]])
+        XCTAssertEqual((scopeSpans[0]["spans"] as? [[String: Any]])?.count, 2)
     }
 }

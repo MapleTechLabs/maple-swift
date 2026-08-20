@@ -26,6 +26,7 @@ public final class MapleTracing: @unchecked Sendable {
     private var processor: BatchSpanProcessor?
     private var exporter: SpanExporter?
     private var tracerBox: Tracer?
+    private var crashReporter: CrashReporter?
     private var lifecycleObservers: [NSObjectProtocol] = []
 
     /// How long the background flush may hold a `UIApplication` background task. The OS
@@ -93,6 +94,10 @@ public final class MapleTracing: @unchecked Sendable {
 
         installLifecycleObservers()
 
+        if newOptions.reportCrashes {
+            startCrashReporting(options: newOptions, processor: processor)
+        }
+
         switch newOptions.instrumentURLSession {
         case .automatic:
             URLSessionInstrumentation.install(
@@ -111,15 +116,49 @@ public final class MapleTracing: @unchecked Sendable {
         }
     }
 
+    // MARK: - Crash reporting
+
+    private func startCrashReporting(options newOptions: TracingOptions, processor: BatchSpanProcessor) {
+        let directory = newOptions.crashDirectory ?? Self.defaultCrashDirectory()
+        guard let directory else { return }
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+
+        // Before anything publishes a new session id over it. The crash being reported
+        // belongs to the previous run, and so does the recording it should link to.
+        LastSessionStore.configure(directory: directory)
+
+        let reporter = CrashReporter(
+            directory: directory,
+            sessionId: LastSessionStore.previousSessionId
+        ) { [weak processor] span in
+            processor?.add(span)
+        }
+        lock.lock()
+        crashReporter = reporter
+        lock.unlock()
+        reporter.start()
+    }
+
+    private static func defaultCrashDirectory() -> URL? {
+        FileManager.default
+            .urls(for: .cachesDirectory, in: .userDomainMask)
+            .first?
+            .appendingPathComponent("maple-tracing", isDirectory: true)
+    }
+
     /// Flush and stop. Idempotent.
     public func stop(completion: (() -> Void)? = nil) {
         lock.lock()
         let processor = self.processor
+        let crashReporter = self.crashReporter
         self.tracerBox = nil
         self.processor = nil
         self.exporter = nil
         self.options = nil
+        self.crashReporter = nil
         lock.unlock()
+
+        crashReporter?.stop()
 
         URLSessionInstrumentation.uninstall()
         ViewControllerInstrumentation.uninstall()

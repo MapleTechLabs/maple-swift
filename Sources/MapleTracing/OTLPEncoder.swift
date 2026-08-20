@@ -14,17 +14,57 @@ import Foundation
 enum OTLPEncoder {
     static func payload(spans: [SpanData], resource: [String: AttributeValue]) -> [String: Any] {
         [
-            "resourceSpans": [[
-                "resource": ["attributes": attributes(resource)],
-                "scopeSpans": [[
-                    "scope": [
-                        "name": "dev.maple.tracing",
-                        "version": MapleTracingVersion.current,
-                    ],
-                    "spans": spans.map(span),
-                ]],
-            ]],
+            "resourceSpans": groups(spans: spans, resource: resource).map { group in
+                [
+                    "resource": ["attributes": attributes(group.resource)],
+                    "scopeSpans": [[
+                        "scope": [
+                            "name": "dev.maple.tracing",
+                            "version": MapleTracingVersion.current,
+                        ],
+                        "spans": group.spans.map(span),
+                    ]],
+                ]
+            },
         ]
+    }
+
+    /// Spans partitioned by their resource.
+    ///
+    /// One entry for the process resource, plus one per distinct set of overrides. Each
+    /// entry carries the *merged* resource rather than the overrides alone: the
+    /// warehouse reads `deployment.environment` and `service.name` off whichever
+    /// `resourceSpans` entry a span arrived in, so a diff-only group would lose every
+    /// attribute it did not restate.
+    private static func groups(
+        spans: [SpanData],
+        resource: [String: AttributeValue]
+    ) -> [(resource: [String: AttributeValue], spans: [SpanData])] {
+        guard spans.contains(where: { !$0.resourceOverrides.isEmpty }) else {
+            return [(resource, spans)]
+        }
+
+        var order: [String] = []
+        var grouped: [String: (resource: [String: AttributeValue], spans: [SpanData])] = [:]
+        for data in spans {
+            let key = groupKey(data.resourceOverrides)
+            if grouped[key] == nil {
+                order.append(key)
+                grouped[key] = (resource.merging(data.resourceOverrides) { _, override in override }, [])
+            }
+            grouped[key]?.spans.append(data)
+        }
+        return order.compactMap { grouped[$0] }
+    }
+
+    /// A stable identity for a set of overrides. `AttributeValue` is `Equatable` but not
+    /// `Hashable`, and the encoded form is already the canonical ordering.
+    private static func groupKey(_ overrides: [String: AttributeValue]) -> String {
+        guard !overrides.isEmpty else { return "" }
+        return overrides
+            .sorted { $0.key < $1.key }
+            .map { "\($0.key)=\($0.value)" }
+            .joined(separator: "\u{1F}")
     }
 
     static func encode(spans: [SpanData], resource: [String: AttributeValue]) throws -> Data {
@@ -51,11 +91,22 @@ enum OTLPEncoder {
         if let traceState = data.context.traceState, !traceState.isEmpty {
             out["traceState"] = traceState
         }
+        if !data.events.isEmpty {
+            out["events"] = data.events.map(event)
+        }
         // `01` = sampled. Anything reaching the encoder is sampled by construction — the
         // tracer drops the rest at `end()` — but the field is not optional in practice:
         // a collector that sees flags `00` may treat the span as dropped.
         out["flags"] = data.context.sampled ? 1 : 0
         return out
+    }
+
+    private static func event(_ event: SpanEvent) -> [String: Any] {
+        [
+            "name": event.name,
+            "timeUnixNano": nanoseconds(event.timestamp),
+            "attributes": attributes(event.attributes),
+        ]
     }
 
     private static func status(_ status: SpanStatus) -> [String: Any] {
@@ -91,5 +142,5 @@ enum OTLPEncoder {
 }
 
 enum MapleTracingVersion {
-    static let current = "0.2.0"
+    static let current = "0.3.0"
 }

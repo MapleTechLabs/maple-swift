@@ -56,6 +56,18 @@ public struct TracingOptions: Sendable {
     /// native, so the cost of the broad default is disclosure, not breakage.
     public var tracePropagationTargets: [String]?
 
+    /// Report crashes captured by MetricKit as spans carrying an `exception` event.
+    ///
+    /// MetricKit hands each crash over on a **later launch** — up to 24 hours later — so
+    /// this answers "what is breaking in this release", not "what is breaking now". It
+    /// installs no signal handler and no exception handler, so it does not compete with
+    /// whatever crash reporter the host app already has.
+    public var reportCrashes: Bool = true
+
+    /// Where crash payloads wait between the launch that receives them and the export
+    /// that ships them. Defaults to `<caches>/maple-tracing/`.
+    public var crashDirectory: URL?
+
     /// Ceiling on spans held between exports. Drop-oldest past this — an app that has
     /// lost its network should not grow a queue until it is killed for memory.
     public var maxQueuedSpans: Int = 2_048
