@@ -175,6 +175,13 @@ public final class Span: @unchecked Sendable {
     public var traceId: String { context.traceId.hex }
     public var spanId: String { context.spanId.hex }
 
+    /// Whether `end()` has already run. Lets a caller holding a span decide
+    /// whether it is still worth tracking, without ending it to find out.
+    public var hasEnded: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return endTime != nil
+    }
+
     public func setAttribute(_ key: String, _ value: AttributeValue) {
         lock.lock(); defer { lock.unlock() }
         guard endTime == nil else { return }

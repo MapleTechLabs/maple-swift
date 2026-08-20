@@ -23,6 +23,12 @@ public enum ViewControllerInstrumentation {
     private static let lock = NSLock()
     nonisolated(unsafe) private static var installed = false
 
+    /// Screens whose span is still open. Weak, so a screen that is never closed
+    /// properly costs a nil slot rather than keeping its span alive for the life
+    /// of the process.
+    nonisolated(unsafe) private static var openScreens: [WeakSpan] = []
+    nonisolated(unsafe) private static var backgroundObserver: (any NSObjectProtocol)?
+
     static var tracer: Tracer? {
         lock.lock(); defer { lock.unlock() }
         return tracerBox
@@ -35,6 +41,13 @@ public enum ViewControllerInstrumentation {
         installed = true
         lock.unlock()
 
+        // Two lifetimes, deliberately separate. Swizzling is once per process and
+        // is never undone. The notification observer *is* undone by `uninstall()`,
+        // so it has to be re-established on every install — folding it into the
+        // `needsSwizzle` branch means a stop/start cycle silently loses screen
+        // bounding, which is exactly how the first version of this shipped.
+        observeBackgrounding()
+
         guard needsSwizzle else { return }
         swizzle(#selector(UIViewController.viewDidAppear(_:)), #selector(UIViewController.maple_viewDidAppear(_:)))
         swizzle(#selector(UIViewController.viewDidDisappear(_:)), #selector(UIViewController.maple_viewDidDisappear(_:)))
@@ -43,7 +56,86 @@ public enum ViewControllerInstrumentation {
     static func uninstall() {
         lock.lock()
         tracerBox = nil
+        openScreens = []
+        let observer = backgroundObserver
+        backgroundObserver = nil
         lock.unlock()
+        if let observer { NotificationCenter.default.removeObserver(observer) }
+    }
+
+    // MARK: - Bounding
+
+    /// Close every open screen span when the app leaves the foreground.
+    ///
+    /// A `ui.screen` span runs from `viewDidAppear` to `viewDidDisappear`, and
+    /// neither fires when the app is backgrounded — nor, in SwiftUI, when a tab's
+    /// root view stops being the visible tab. A screen left open overnight
+    /// therefore produced one span covering the whole night: spans of eleven hours
+    /// reached the warehouse, where nothing distinguishes them from an eleven-hour
+    /// request and they dominate every latency percentile the service reports.
+    ///
+    /// Ending here is also the more honest reading of the signal. `ui.screen`
+    /// measures how long a screen was in front of someone, and nobody is looking
+    /// at it while the app is in the background.
+    ///
+    /// Deliberately no automatic restart on foreground. The span was handed to
+    /// whoever asked for it — a `UIViewController`'s associated object, or
+    /// SwiftUI's `@State` — and a replacement started here would be one that
+    /// caller never sees and never ends, which is the same leak from the other
+    /// end. A host that wants the second sitting counted re-opens it itself;
+    /// `Span.end()` is idempotent, so the stale reference it still holds is
+    /// harmless.
+    private static func observeBackgrounding() {
+        lock.lock()
+        let alreadyObserving = backgroundObserver != nil
+        lock.unlock()
+        guard !alreadyObserving else { return }
+
+        let observer = NotificationCenter.default.addObserver(
+            forName: UIApplication.didEnterBackgroundNotification,
+            object: nil,
+            queue: nil
+        ) { _ in
+            endOpenScreens(reason: "background")
+        }
+        lock.lock()
+        backgroundObserver = observer
+        lock.unlock()
+    }
+
+    /// End every open screen span, recording why. Public for a host app that
+    /// knows it has left a screen before the notification would say so.
+    public static func endOpenScreens(reason: String) {
+        lock.lock()
+        let screens = openScreens
+        openScreens = []
+        lock.unlock()
+
+        for entry in screens {
+            guard let span = entry.span, !span.hasEnded else { continue }
+            span.setAttribute("maple.screen.end_reason", .string(reason))
+            span.end()
+        }
+    }
+
+    private static func track(_ span: Span) {
+        lock.lock(); defer { lock.unlock() }
+        // Drop slots whose span has been released or already ended, so a long
+        // session does not accumulate one entry per screen ever visited.
+        openScreens.removeAll { $0.span == nil || $0.span?.hasEnded == true }
+        openScreens.append(WeakSpan(span))
+    }
+
+    /// Screen spans still open. For tests.
+    static var openScreenCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return openScreens.filter { $0.span?.hasEnded == false }.count
+    }
+
+    /// `Span` is a class, so this can hold it weakly — an array of `weak` needs a box.
+    private final class WeakSpan {
+        weak var span: Span?
+        init(_ span: Span) { self.span = span }
     }
 
     /// Record a screen appearance by name. Public because SwiftUI has no controller to
@@ -62,6 +154,10 @@ public enum ViewControllerInstrumentation {
         SessionSink.shared.emit(
             SessionEventDraft(kind: .navigation, traceId: span?.traceId, message: name)
         )
+        // Registered so backgrounding can close it. Neither `viewDidDisappear`
+        // nor SwiftUI's `onDisappear` fires on the way to the background, and a
+        // screen span nobody closes runs until the process dies.
+        if let span { track(span) }
         return span
     }
 
