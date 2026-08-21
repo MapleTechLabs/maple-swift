@@ -159,8 +159,18 @@ Two small swizzles remain, and each buys something the protocol cannot:
 - `URLSessionConfiguration.default`/`.ephemeral` add the interceptor to sessions the app builds
   itself. `URLProtocol.registerClass` only reaches `URLSession.shared`.
 
-Requests with an `httpBodyStream` are left alone: a stream cannot be replayed, and re-issuing the
-request is exactly what the interceptor does. Losing a span there beats losing the upload.
+Requests with a body are re-issued with that body carried across. Foundation hands a
+`URLProtocol` *every* body as `httpBodyStream` — `httpBody`, `from: Data`, `fromFile:` and a
+delegate-fed stream alike — so declining streams meant declining every POST, PUT and PATCH an app
+made: no span, and no `traceparent`, which left the backend's server span in a trace of its own.
+The framing the app chose is preserved: a body with a declared `Content-Length` up to 1 MiB is read
+and re-sent by value, and anything longer or undeclared is handed on as a stream. A body that comes
+up short of its declared length fails the request rather than sending a truncated one — losing an
+upload to gain a span is never the trade.
+
+One consequence: a streamed body can only be handed over once, so a redirect or retry that asks for
+a second copy fails instead of resending a partial one. That is the same position the app is in,
+having handed a stream downwards rather than a way to make another.
 
 `instrumentURLSession = .manual` installs none of it; use `MapleTracing.shared.trace(_:)` and
 `traceHeaders()` instead.
@@ -455,6 +465,7 @@ Known gaps in tracing, all deliberate:
 - **Crash stacks are unsymbolicated** — no dSYM upload yet, so frames are binary + offset and
   grouping is by binary rather than by function.
 - MetricKit delivers nothing on the **simulator**. Crash reporting needs a device.
-- **Upload tasks with a body stream** are not traced (see above).
+- A **redirected or retried streamed upload** fails rather than resending a spent body stream
+  (see above).
 - `identify()` is not wired to spans yet: `user.id` is stamped by the browser SDK, and the mobile
   metadata row still sends the identity columns empty.

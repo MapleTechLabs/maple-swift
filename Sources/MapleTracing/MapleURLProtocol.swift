@@ -19,6 +19,11 @@ import MapleCore
 final class MapleURLProtocol: URLProtocol {
     private static let handledKey = "dev.maple.tracing.handled"
 
+    /// Largest body the relay will hold in memory to reproduce a fixed-length request.
+    /// Past this it hands the original stream on instead, so tracing never doubles the
+    /// residency of a large upload.
+    private static let maxBufferedBodyBytes = 1 << 20
+
     /// Test seam. A `URLSession` built from a configuration does not consult
     /// globally-registered protocols, so a test's stub protocol is invisible to the relay
     /// and every assertion about what we actually send would be untestable without this.
@@ -53,10 +58,13 @@ final class MapleURLProtocol: URLProtocol {
     override class func canInit(with request: URLRequest) -> Bool {
         guard property(forKey: handledKey, in: request) == nil else { return false }
         guard let hooks = URLSessionInstrumentation.current else { return false }
-        // Body streams cannot be replayed, and re-issuing the request is exactly what
-        // this protocol does. Leaving them alone loses a span; consuming them would lose
-        // the upload.
-        guard request.httpBodyStream == nil else { return false }
+        // Bodies used to be declined here, on the theory that a stream cannot be replayed.
+        // Foundation hands a protocol *every* body as `httpBodyStream` — `httpBody`,
+        // `from: Data`, `fromFile:` and a delegate-fed stream alike, measured per API in
+        // `URLProtocolBodyVisibilityTests` — so that guard did not skip streams, it skipped
+        // every POST, PUT and PATCH an app makes: no span, and no `traceparent`, which left
+        // the backend's server span in a trace of its own. `startLoading` carries the body
+        // across instead, by value or by reference.
         return hooks.shouldTrace(request)
     }
 
@@ -72,10 +80,76 @@ final class MapleURLProtocol: URLProtocol {
         let outgoing = (traced as NSURLRequest).mutableCopy() as! NSMutableURLRequest
         Self.setProperty(true, forKey: Self.handledKey, in: outgoing)
 
-        let task = Self.relay.dataTask(with: outgoing as URLRequest)
+        // How the body travels decides how the request is framed on the wire, so the rule
+        // is to preserve whatever framing the app's own request would have had: a declared
+        // length is reproduced by value, an undeclared one is handed on as a stream and
+        // stays chunked. Buffering the undeclared case instead would turn a chunked upload
+        // of unknown size into a resident allocation of unknown size.
+        var passthrough: InputStream?
+        if let stream = request.httpBodyStream {
+            if let length = Self.declaredBodyLength(of: request), length <= Self.maxBufferedBodyBytes {
+                guard let body = Self.read(stream, exactly: length) else {
+                    // The stream is spent and came up short, so there is no correct request
+                    // left to send. Failing is the only honest outcome — a truncated upload
+                    // would be a silent data loss caused by tracing.
+                    span?.setStatus(.error("request body could not be read"))
+                    fail(with: URLError(.cannotLoadFromNetwork))
+                    return
+                }
+                // Assigning the body is what clears the stream: the two are mutually
+                // exclusive on `NSMutableURLRequest`, and setting the stream to nil
+                // afterwards clears the body right back out again.
+                outgoing.httpBody = body
+                span?.setAttribute("http.request.body.size", .int(Int64(body.count)))
+            } else {
+                passthrough = stream
+            }
+        }
+
+        let task: URLSessionTask
+        if let passthrough {
+            // `uploadTask(withStreamedRequest:)` ignores the request's own stream and asks
+            // the delegate for one — the same contract the app was already using, since an
+            // undeclared length is what a streamed upload looks like from below.
+            task = Self.relay.uploadTask(withStreamedRequest: outgoing as URLRequest)
+            RelayDelegate.shared.register(task: task, protocolInstance: self, bodyStream: passthrough)
+        } else {
+            task = Self.relay.dataTask(with: outgoing as URLRequest)
+            RelayDelegate.shared.register(task: task, protocolInstance: self)
+        }
         self.relayTask = task
-        RelayDelegate.shared.register(task: task, protocolInstance: self)
         task.resume()
+    }
+
+    /// `Content-Length` as the app set it, or as Foundation derived it from a `Data` or
+    /// file body. Absent for a delegate-fed stream, which is exactly the case that must not
+    /// be buffered.
+    private static func declaredBodyLength(of request: URLRequest) -> Int? {
+        guard let value = request.value(forHTTPHeaderField: "Content-Length"),
+              let length = Int(value), length >= 0
+        else { return nil }
+        return length
+    }
+
+    /// Reads exactly `length` bytes, or returns nil. A short read is a failure rather than
+    /// a smaller body: the request declared a length and the relay has to honour it.
+    private static func read(_ stream: InputStream, exactly length: Int) -> Data? {
+        stream.open()
+        defer { stream.close() }
+        var data = Data(capacity: length)
+        var buffer = [UInt8](repeating: 0, count: min(length, 64 * 1024))
+        while data.count < length {
+            let read = stream.read(&buffer, maxLength: min(buffer.count, length - data.count))
+            if read <= 0 { break }
+            data.append(buffer, count: read)
+        }
+        return data.count == length ? data : nil
+    }
+
+    private func fail(with error: Error) {
+        span.map { URLSessionInstrumentation.finish(span: $0, response: nil, error: error, request: request) }
+        span = nil
+        client?.urlProtocol(self, didFailWithError: error)
     }
 
     override func stopLoading() {
@@ -131,15 +205,35 @@ private final class RelayDelegate: NSObject, URLSessionDataDelegate {
 
     private let lock = NSLock()
     private var handlers: [Int: MapleURLProtocol] = [:]
+    private var bodyStreams: [Int: InputStream] = [:]
 
-    func register(task: URLSessionTask, protocolInstance: MapleURLProtocol) {
+    func register(task: URLSessionTask, protocolInstance: MapleURLProtocol, bodyStream: InputStream? = nil) {
         lock.lock(); defer { lock.unlock() }
         handlers[task.taskIdentifier] = protocolInstance
+        bodyStreams[task.taskIdentifier] = bodyStream
     }
 
     func unregister(task: URLSessionTask) {
         lock.lock(); defer { lock.unlock() }
         handlers.removeValue(forKey: task.taskIdentifier)
+        bodyStreams.removeValue(forKey: task.taskIdentifier)
+    }
+
+    /// Hands over the app's own body stream, once.
+    ///
+    /// A second ask means a retry or a redirect, and the stream is spent by then — the same
+    /// position the app itself would be in, since it handed the stream downwards rather than
+    /// a way to make another one. `nil` fails that attempt instead of resending a partial
+    /// body.
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        needNewBodyStream completionHandler: @escaping (InputStream?) -> Void
+    ) {
+        lock.lock()
+        let stream = bodyStreams.removeValue(forKey: task.taskIdentifier)
+        lock.unlock()
+        completionHandler(stream)
     }
 
     private func handler(for task: URLSessionTask) -> MapleURLProtocol? {
