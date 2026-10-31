@@ -18,16 +18,21 @@ enum VideoEncoderError: Error {
     case writerSetupFailed(String)
     case pixelBufferPoolUnavailable
     case encodeFailed(String)
+    case timedOut(String)
 }
 
 /// Encodes buffered JPEG frames into an H.264/MP4 segment via AVAssetWriter.
 ///
-/// Constant frame rate: presentation times are derived from the frame index and the
-/// configured rate rather than from wall-clock capture timestamps. The declared wire
-/// format says `frameRateType: "constant"`, and a player that trusts that field will
-/// desynchronise if we emit variable timings. Real capture jitter at 1 fps is well under
-/// one frame, so nothing is lost.
+/// Presentation times come from each frame's capture timestamp, not its index. Capture
+/// misses ticks whenever the main thread is busy, and an index-based clock then plays
+/// the segment faster than it happened, drifting every touch and transcript event off
+/// the frame it belongs to. The last frame is held for one nominal frame interval.
 enum VideoEncoder {
+    /// Ceiling on any one wait inside an encode. AVAssetWriter can stop accepting input
+    /// without ever reporting failure, and this runs on the queue every later segment
+    /// waits behind, so a stuck writer must cost one segment, never the session.
+    static let stepTimeout: TimeInterval = 10
+
     static func encode(
         frames: [CapturedFrame],
         options: ReplayOptions,
@@ -38,7 +43,11 @@ enum VideoEncoder {
         let size = first.size
         let width = Int(size.width)
         let height = Int(size.height)
-        let frameRate = max(1, options.frameRate)
+        guard width >= 2, height >= 2 else {
+            throw VideoEncoderError.writerSetupFailed("frame size \(width)x\(height) is too small to encode")
+        }
+        let frameRate = min(10, max(1, options.frameRate))
+        let times = presentationTimes(for: frames.map(\.timestamp), frameRate: frameRate)
 
         try? FileManager.default.removeItem(at: url)
 
@@ -60,7 +69,7 @@ enum VideoEncoder {
                     // One keyframe per segment. Segments are played independently, so
                     // every segment must open with an IDR frame or the first frames
                     // decode to nothing.
-                    AVVideoMaxKeyFrameIntervalKey: frames.count,
+                    AVVideoMaxKeyFrameIntervalKey: max(1, frames.count),
                     AVVideoProfileLevelKey: AVVideoProfileLevelH264BaselineAutoLevel,
                 ],
             ]
@@ -93,30 +102,51 @@ enum VideoEncoder {
             throw VideoEncoderError.pixelBufferPoolUnavailable
         }
 
+        var written = 0
         for (index, frame) in frames.enumerated() {
             guard let buffer = pixelBuffer(from: frame, pool: pool, size: size) else { continue }
 
-            // Spin rather than using the async callback API: this runs on a dedicated
-            // serial encode queue with a bounded frame count, so blocking is contained
-            // and the control flow stays legible.
+            // Polled rather than driven by `requestMediaDataWhenReady`: this runs on a
+            // dedicated serial queue with a bounded frame count, so blocking is contained.
+            // The status check and deadline are what keep a dead writer from spinning here
+            // forever, which is the one outcome worse than a lost segment.
+            let deadline = Date().addingTimeInterval(stepTimeout)
             while !input.isReadyForMoreMediaData {
+                guard writer.status == .writing else {
+                    throw VideoEncoderError.encodeFailed(
+                        writer.error?.localizedDescription ?? "writer stopped at frame \(index)"
+                    )
+                }
+                guard Date() < deadline else {
+                    writer.cancelWriting()
+                    throw VideoEncoderError.timedOut("input not ready at frame \(index)")
+                }
                 Thread.sleep(forTimeInterval: 0.005)
             }
 
-            let time = CMTime(value: CMTimeValue(index), timescale: CMTimeScale(frameRate))
-            if !adaptor.append(buffer, withPresentationTime: time) {
+            if !adaptor.append(buffer, withPresentationTime: times.frames[index]) {
                 writer.cancelWriting()
                 throw VideoEncoderError.encodeFailed(
                     writer.error?.localizedDescription ?? "append failed at frame \(index)"
                 )
             }
+            written += 1
+        }
+
+        guard written > 0 else {
+            writer.cancelWriting()
+            throw VideoEncoderError.encodeFailed("no frame decoded")
         }
 
         input.markAsFinished()
+        writer.endSession(atSourceTime: times.end)
 
-        let semaphore = DispatchSemaphore(value: 0)
-        writer.finishWriting { semaphore.signal() }
-        semaphore.wait()
+        let finished = DispatchSemaphore(value: 0)
+        writer.finishWriting { finished.signal() }
+        if finished.wait(timeout: .now() + stepTimeout) == .timedOut {
+            writer.cancelWriting()
+            throw VideoEncoderError.timedOut("finishWriting did not complete")
+        }
 
         if writer.status != .completed {
             throw VideoEncoderError.encodeFailed(
@@ -132,11 +162,39 @@ enum VideoEncoder {
             byteSize: byteSize,
             width: width,
             height: height,
-            frameCount: frames.count,
+            frameCount: written,
             frameRate: frameRate,
-            duration: Double(frames.count) / Double(frameRate),
+            duration: times.end.seconds,
             start: first.timestamp
         )
+    }
+
+    /// Millisecond presentation times for frames captured at `timestamps`, plus the time
+    /// the last one stops showing.
+    ///
+    /// Strictly increasing whatever the input: a wall clock can step backwards (an NTP
+    /// correction, a user changing the time) and AVAssetWriter fails the whole segment on
+    /// one non-increasing sample.
+    static func presentationTimes(
+        for timestamps: [Date],
+        frameRate: Int
+    ) -> (frames: [CMTime], end: CMTime) {
+        let frameMs = Int64(1000 / max(1, frameRate))
+        guard let origin = timestamps.first else {
+            return ([], CMTime(value: frameMs, timescale: 1000))
+        }
+        var values: [Int64] = []
+        values.reserveCapacity(timestamps.count)
+        var previous: Int64 = -1
+        for timestamp in timestamps {
+            let elapsed = timestamp.timeIntervalSince(origin) * 1000
+            let raw = elapsed.isFinite ? Int64(max(0, min(elapsed, 86_400_000)).rounded()) : 0
+            let value = max(raw, previous + 1)
+            values.append(value)
+            previous = value
+        }
+        let frames = values.map { CMTime(value: $0, timescale: 1000) }
+        return (frames, CMTime(value: previous + frameMs, timescale: 1000))
     }
 
     private static func pixelBuffer(
@@ -164,7 +222,24 @@ enum VideoEncoder {
                 | CGBitmapInfo.byteOrder32Little.rawValue
         ) else { return nil }
 
-        context.draw(image, in: CGRect(origin: .zero, size: size))
+        // Aspect-fit on black. Callers split segments on size changes, so this only
+        // matters for a JPEG whose decoded size disagrees with its frame, where a
+        // letterbox beats a stretch.
+        context.setFillColor(gray: 0, alpha: 1)
+        context.fill(CGRect(origin: .zero, size: size))
+        context.draw(image, in: aspectFit(CGSize(width: image.width, height: image.height), in: size))
         return buffer
+    }
+
+    static func aspectFit(_ content: CGSize, in bounds: CGSize) -> CGRect {
+        guard content.width > 0, content.height > 0 else { return CGRect(origin: .zero, size: bounds) }
+        let scale = min(bounds.width / content.width, bounds.height / content.height)
+        let fitted = CGSize(width: content.width * scale, height: content.height * scale)
+        return CGRect(
+            x: (bounds.width - fitted.width) / 2,
+            y: (bounds.height - fitted.height) / 2,
+            width: fitted.width,
+            height: fitted.height
+        )
     }
 }

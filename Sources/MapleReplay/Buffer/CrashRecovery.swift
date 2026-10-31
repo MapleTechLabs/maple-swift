@@ -33,7 +33,9 @@ enum CrashRecovery {
     /// endpoint and key.
     struct RecoveredSession {
         let sessionId: String
-        let segment: PreparedSegment
+        /// Usually one. More when the device rotated inside the spooled window, because a
+        /// video track has a single size.
+        let segments: [PreparedSegment]
         /// The `ended` row for the crashed session. Its `active` row was posted at that
         /// session's own start, so this is the only one missing.
         let endedRow: SessionMetaRow
@@ -54,6 +56,8 @@ enum CrashRecovery {
         persistToDisk: Bool = false,
         onRecovered: (RecoveredSession) -> Void
     ) -> [RecoveredSession] {
+        removeUnreadableSpools(root: root, activeSessionId: activeSessionId)
+        removeStaleTemporaryFiles()
         var pending = pendingSessions(root: root, activeSessionId: activeSessionId)
         pending = prune(pending, limits: limits)
 
@@ -76,10 +80,58 @@ enum CrashRecovery {
         )) ?? []
 
         return directories
-            .filter { $0.lastPathComponent != activeSessionId }
+            .filter { !isActive($0, activeSessionId: activeSessionId) }
             .filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true }
             .compactMap(SpooledSession.read)
+            .filter { $0.manifest.sessionId != activeSessionId }
             .sorted { $0.manifest.startedAt > $1.manifest.startedAt }
+    }
+
+    private static func isActive(_ directory: URL, activeSessionId: String?) -> Bool {
+        guard let activeSessionId else { return false }
+        let name = directory.lastPathComponent
+        return name == activeSessionId || name.hasPrefix(activeSessionId + ".")
+    }
+
+    /// Delete spool entries no recovery can read: a directory whose manifest is missing
+    /// or corrupt (a crash between `createDirectory` and the manifest write, a torn disk),
+    /// or a stray file.
+    ///
+    /// They would otherwise stay forever, invisible to the byte budget, because the
+    /// budget only counts spools it can read.
+    static func removeUnreadableSpools(root: URL, activeSessionId: String?) {
+        let spoolRoot = FrameSpool.spoolRoot(in: root)
+        let entries = (try? FileManager.default.contentsOfDirectory(
+            at: spoolRoot, includingPropertiesForKeys: [.isDirectoryKey], options: []
+        )) ?? []
+        for entry in entries where !isActive(entry, activeSessionId: activeSessionId) {
+            let isDirectory = (try? entry.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
+            if !isDirectory || SpooledSession.read(directory: entry) == nil {
+                try? FileManager.default.removeItem(at: entry)
+            }
+        }
+    }
+
+    /// Encoder scratch files a crash interrupted. Old enough that no live encode in this
+    /// process can own them: one encode is bounded by `VideoEncoder.stepTimeout` per step.
+    static func removeStaleTemporaryFiles(
+        in directory: URL = FileManager.default.temporaryDirectory,
+        olderThan age: TimeInterval = 600,
+        now: Date = Date()
+    ) {
+        let entries = (try? FileManager.default.contentsOfDirectory(
+            at: directory, includingPropertiesForKeys: [.contentModificationDateKey], options: []
+        )) ?? []
+        for entry in entries {
+            let name = entry.lastPathComponent
+            guard name.hasPrefix("maple-segment-") || name.hasPrefix("maple-recovered-"),
+                  name.hasSuffix(".mp4") else { continue }
+            let modified = (try? entry.resourceValues(forKeys: [.contentModificationDateKey]))?
+                .contentModificationDate ?? .distantPast
+            if now.timeIntervalSince(modified) > age {
+                try? FileManager.default.removeItem(at: entry)
+            }
+        }
     }
 
     /// Enforce the disk ceiling before any recovery work happens.
@@ -135,10 +187,8 @@ enum CrashRecovery {
         }
 
         let manifest = session.manifest
-        let start = frames.first?.timestamp ?? manifest.startDate
-        let end = frames.last?.timestamp ?? start
+        let end = frames.last?.timestamp ?? manifest.startDate
         let options = manifest.encodeOptions
-        let seq = manifest.nextChunkSeq
 
         let writer = SegmentWriter(
             directory: root.appendingPathComponent(manifest.sessionId, isDirectory: true),
@@ -146,22 +196,21 @@ enum CrashRecovery {
             persistToDisk: persistToDisk
         )
 
-        do {
-            let temporaryURL = FileManager.default.temporaryDirectory
-                .appendingPathComponent("maple-recovered-\(manifest.sessionId)-\(seq).mp4")
-            let video = try VideoEncoder.encode(frames: frames, options: options, to: temporaryURL)
+        let runs = frames.runsOfEqualSize()
+        var segments: [PreparedSegment] = []
+        for (index, run) in runs.enumerated() {
+            let seq = manifest.nextChunkSeq + index
+            guard let start = run.first?.timestamp else { continue }
+            let isLast = index == runs.count - 1
+            do {
+                let temporaryURL = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("maple-recovered-\(manifest.sessionId)-\(seq).mp4")
+                let video = try VideoEncoder.encode(frames: run, options: options, to: temporaryURL)
 
-            let events = SegmentEvents.build(
-                sessionId: manifest.sessionId,
-                chunkSeq: seq,
-                video: video,
-                start: start,
-                reason: "crash",
-                extra: [
-                    // The marker that tells anyone reading this segment why it exists,
-                    // and that its tail is where the process died. Touch events are not
-                    // here: they only ever lived in memory, so a recovered segment is
-                    // video and timing only.
+                // The marker that tells anyone reading this segment why it exists, and
+                // that its tail is where the process died. Touch events are not here: they
+                // only ever lived in memory, so a recovered segment is video and timing only.
+                let marker: [RRWebEvent] = isLast ? [
                     .breadcrumb(
                         timestamp: end,
                         category: "replay.crash_recovery",
@@ -171,39 +220,58 @@ enum CrashRecovery {
                             "spooledBytes": session.byteSize,
                             "attempt": manifest.recoveryAttempts,
                         ]
-                    )
-                ]
-            )
-
-            let segment = try writer.prepare(
-                video: video, events: events, chunkSeq: seq, isCheckpoint: true
-            )
-
-            // Close out the session row too. The `active` row posted at that session's
-            // start is complete by design, but a session that never ends stays open
-            // forever; the last spooled frame is the best end time available.
-            let endedRow = SessionMetaRow(
-                sessionId: manifest.sessionId,
-                startedAt: manifest.startDate,
-                status: .ended,
-                version: 2,
-                serviceName: manifest.serviceName,
-                environment: manifest.environment,
-                userId: manifest.userId,
-                recorded: true
-            )
-            if persistToDisk { endedRow.append(to: writer.directory, now: end) }
-
-            try? FileManager.default.removeItem(at: session.directory)
-            return RecoveredSession(
-                sessionId: manifest.sessionId,
-                segment: segment,
-                endedRow: endedRow,
-                endedAt: end
-            )
-        } catch {
-            NSLog("[MapleReplay] recovery of \(manifest.sessionId) failed: \(error)")
-            return nil
+                    ),
+                ] : []
+                let events = SegmentEvents.build(
+                    sessionId: manifest.sessionId,
+                    chunkSeq: seq,
+                    video: video,
+                    start: start,
+                    reason: "crash",
+                    extra: marker
+                )
+                segments.append(
+                    try writer.prepare(video: video, events: events, chunkSeq: seq, isCheckpoint: true)
+                )
+            } catch {
+                NSLog("[MapleReplay] recovery of \(manifest.sessionId) segment \(seq) failed: \(error)")
+            }
         }
+        // Nothing encoded: leave the spool for the next launch, which the attempt count
+        // above bounds.
+        guard !segments.isEmpty else { return nil }
+
+        // Close out the session row too. A session that never ends stays open forever,
+        // and the last spooled frame is the best end time available.
+        let endedRow = SessionMetaRow(
+            sessionId: manifest.sessionId,
+            startedAt: manifest.startDate,
+            status: .ended,
+            version: recoveredRowVersion(),
+            serviceName: manifest.serviceName,
+            environment: manifest.environment,
+            userId: manifest.userId,
+            recorded: true,
+            replayTrigger: manifest.mode == ReplayMode.buffer.rawValue ? "error" : nil
+        )
+        if persistToDisk { endedRow.append(to: writer.directory, now: end) }
+
+        try? FileManager.default.removeItem(at: session.directory)
+        return RecoveredSession(
+            sessionId: manifest.sessionId,
+            segments: segments,
+            endedRow: endedRow,
+            endedAt: end
+        )
+    }
+
+    /// Version for the row that closes a crashed session.
+    ///
+    /// The table keeps the highest version, and the crashed process posted an unknown
+    /// number of rows (a resume or a promotion each posts one). This row is the last word
+    /// on that session, so it takes a version no live counter reaches: the epoch second,
+    /// which fits the column's UInt32 until 2106.
+    static func recoveredRowVersion(now: Date = Date()) -> Int {
+        max(3, Int(min(now.timeIntervalSince1970, Double(UInt32.max))))
     }
 }

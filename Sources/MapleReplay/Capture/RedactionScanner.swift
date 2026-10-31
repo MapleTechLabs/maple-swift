@@ -45,11 +45,46 @@ struct RedactionScanner {
     /// lives inside the window it is scanning and would otherwise mask itself — and,
     /// being an unrecognised leaf, would mask the entire screen.
     func rects(in root: UIView, excluding: UIView? = nil) -> [CGRect] {
-        var result: [CGRect] = []
+        scan(in: root, excluding: excluding).rects
+    }
+
+    /// One scan's output.
+    struct Result: Equatable {
+        /// Everything to paint over.
+        var rects: [CGRect]
+        /// The subset masked no matter what (typed input, explicit masks, always-masked
+        /// classes), where a touch's position must not be recorded either.
+        var sensitive: [CGRect]
+    }
+
+    /// A rect plus whether an unmask region is allowed to drop it.
+    struct Redaction {
+        var rect: CGRect
+        var forced: Bool
+    }
+
+    private struct Walk {
+        var redactions: [Redaction] = []
+        var unmaskRegions: [CGRect] = []
+    }
+
+    func scan(in root: UIView, excluding: UIView? = nil) -> Result {
+        var walk = Walk()
         // The capture is the root's bounds, so that is the outermost clip. Anything
         // outside it was never rasterised and a rect over it can only mask other content.
-        scan(root, root: root, excluding: excluding, clip: root.bounds, into: &result)
-        return merge(result)
+        scan(
+            root, root: root, excluding: excluding, clip: root.bounds,
+            animating: false, secureOnly: false, into: &walk
+        )
+        // An unmask region drops what lies wholly inside it, never what it only touches,
+        // and never a forced mask.
+        let kept = walk.redactions.filter { redaction in
+            redaction.forced || !walk.unmaskRegions.contains { $0.contains(redaction.rect) }
+        }
+        return Result(
+            rects: merge(kept.map(\.rect)),
+            sensitive: merge(kept.filter(\.forced).map(\.rect))
+        )
     }
 
     /// Which views produced which rects, for diagnosing over-masking.
@@ -74,6 +109,11 @@ struct RedactionScanner {
 
         guard let visible = clipped(view.convert(view.bounds, to: root), to: clip) else { return }
 
+        if let marker = view as? ReplayMarkerView {
+            if marker.kind == .mask { result.append(("mapleReplayMask()", visible)) }
+            return
+        }
+
         if shouldMask(view) {
             result.append((NSStringFromClass(type(of: view)), visible))
             return
@@ -91,7 +131,8 @@ struct RedactionScanner {
     }
 
     private func scan(
-        _ view: UIView, root: UIView, excluding: UIView?, clip: CGRect, into result: inout [CGRect]
+        _ view: UIView, root: UIView, excluding: UIView?, clip: CGRect,
+        animating ancestorAnimating: Bool, secureOnly: Bool, into walk: inout Walk
     ) {
         guard view !== excluding else { return }
         // The debug overlay is an unrecognised leaf, so the unknown-leaf rule would have
@@ -99,47 +140,112 @@ struct RedactionScanner {
         guard !(view is MaskingPreviewView) else { return }
         guard !view.isHidden, view.alpha > 0.01 else { return }
 
-        // An explicit unmask opt-out wins over everything, including the unknown-leaf rule.
-        // This is the single escape hatch, and it is deliberately the only one.
-        if isExplicitlyUnmasked(view) { return }
+        // Sticky down the tree: a pushed controller animates its root view's layer, and
+        // every descendant is drawn wherever that animation has carried it.
+        let animating = ancestorAnimating || !(view.layer.animationKeys()?.isEmpty ?? true)
 
         // `clip` is the intersection of every clipping ancestor's bounds — the region this
         // view can actually appear in. A rect outside it covers content the view does not
         // draw, and a view entirely outside it is not on the captured frame at all.
-        guard let visible = clipped(view.convert(view.bounds, to: root), to: clip) else { return }
+        let modelRect = clipped(view.convert(view.bounds, to: root), to: clip)
+        // Mid-animation the frame on screen is the presentation tree's, while the view
+        // tree already holds the end state. Masking both places is the only answer that
+        // covers the drawn frame without trusting either clock.
+        let presentationRect = animating ? presentationRect(of: view.layer, in: root) : nil
+        guard modelRect != nil || presentationRect != nil else { return }
 
-        if shouldMask(view) {
-            result.append(visible)
-            // Masking the parent covers every descendant; no need to walk further.
+        func add(forced: Bool) {
+            for rect in [modelRect, presentationRect].compactMap({ $0 }) {
+                walk.redactions.append(Redaction(rect: rect, forced: forced))
+            }
+        }
+
+        if let marker = view as? ReplayMarkerView {
+            switch marker.kind {
+            case .mask: add(forced: true)
+            case .unmask: walk.unmaskRegions.append(contentsOf: [modelRect, presentationRect].compactMap { $0 })
+            }
             return
         }
 
-        // Content this view draws into its *own* layers, independent of its subviews.
-        //
-        // This is the case a leaf-only rule misses entirely. Since iOS 26, SwiftUI draws
-        // text and shapes as `CGDrawingLayer` sublayers of a host view that also has
-        // child views — so the host is not a leaf, and every string it rendered would
-        // otherwise never be examined. Masking the host wholesale would redact the screen;
-        // masking its drawing layers individually is precise.
-        //
-        // Gated on `maskAllText` for the same reason as the unknown-leaf rule: a
-        // `CGDrawingLayer` carries no type information, so we cannot tell a rendered
-        // string from a rendered image and must treat the whole category as text.
-        // A consequence worth stating plainly: SwiftUI-drawn images are covered by
-        // `maskAllText`, not by `maskAllImages`, which only reaches `UIImageView`.
+        if secureOnly {
+            // Inside an explicit unmask. Secure entry is the one category no opt-out
+            // reaches: a password in a replay is never what anyone meant to allow.
+            if let input = view as? UITextInputTraits, input.isSecureTextEntry == true {
+                add(forced: true)
+                return
+            }
+        } else {
+            // An explicit unmask opt-out wins over every rule but secure entry. This is
+            // the escape hatch, and it is deliberately narrow.
+            if isExplicitlyUnmasked(view) {
+                scanSubviews(of: view, root: root, excluding: excluding, clip: clip, visible: modelRect,
+                             animating: animating, secureOnly: true, into: &walk)
+                return
+            }
 
-        // A view that clips narrows the clip for everything beneath it — its own drawing
-        // layers included. A view that does not clip passes the ancestors' clip through
-        // unchanged, because UIKit draws subviews outside a non-clipping parent's bounds.
-        let subtreeClip = view.clipsToBounds ? visible : clip
+            if let forced = maskDecision(view) {
+                add(forced: forced)
+                // Masking the parent covers every descendant; no need to walk further.
+                return
+            }
 
-        if options.maskAllText {
-            result.append(contentsOf: contentLayerRects(of: view, root: root, clip: subtreeClip))
+            // Content this view draws into its *own* layers, independent of its subviews.
+            //
+            // This is the case a leaf-only rule misses entirely. Since iOS 26, SwiftUI
+            // draws text and shapes as `CGDrawingLayer` sublayers of a host view that also
+            // has child views — so the host is not a leaf, and every string it rendered
+            // would otherwise never be examined. Masking the host wholesale would redact
+            // the screen; masking its drawing layers individually is precise.
+            //
+            // Gated on `maskAllText` for the same reason as the unknown-leaf rule: a
+            // `CGDrawingLayer` carries no type information, so we cannot tell a rendered
+            // string from a rendered image and must treat the whole category as text.
+            // SwiftUI-drawn images are therefore covered by `maskAllText`, not by
+            // `maskAllImages`, which only reaches `UIImageView`.
+            if options.maskAllText {
+                let subtreeClip = view.clipsToBounds ? (modelRect ?? clip) : clip
+                for rect in contentLayerRects(of: view, root: root, clip: subtreeClip, animating: animating) {
+                    walk.redactions.append(Redaction(rect: rect, forced: false))
+                }
+            }
         }
 
+        scanSubviews(of: view, root: root, excluding: excluding, clip: clip, visible: modelRect,
+                     animating: animating, secureOnly: secureOnly, into: &walk)
+    }
+
+    private func scanSubviews(
+        of view: UIView, root: UIView, excluding: UIView?, clip: CGRect, visible: CGRect?,
+        animating: Bool, secureOnly: Bool, into walk: inout Walk
+    ) {
+        // A view that clips narrows the clip for everything beneath it. A view that does
+        // not clip passes the ancestors' clip through unchanged, because UIKit draws
+        // subviews outside a non-clipping parent's bounds. A clipping view whose model
+        // rect is off-frame but is mid-animation keeps the outer clip: its presentation
+        // may be on frame, and narrowing to nothing would let its children through.
+        let subtreeClip: CGRect
+        if view.clipsToBounds, !animating {
+            guard let visible else { return }
+            subtreeClip = visible
+        } else {
+            subtreeClip = clip
+        }
         for subview in view.subviews {
-            scan(subview, root: root, excluding: excluding, clip: subtreeClip, into: &result)
+            scan(subview, root: root, excluding: excluding, clip: subtreeClip,
+                 animating: animating, secureOnly: secureOnly, into: &walk)
         }
+    }
+
+    /// Where `layer` is drawn right now, in `root`'s space, clipped to the captured frame.
+    ///
+    /// Clipped to the root rather than to the model-tree clip: during a transition the
+    /// clipping ancestors are moving too, and a model clip would cut away exactly the
+    /// part of the presentation rect that is on screen.
+    private func presentationRect(of layer: CALayer, in root: UIView) -> CGRect? {
+        guard let rootLayer = root.layer.presentation() ?? Optional(root.layer),
+              let presented = layer.presentation() else { return nil }
+        return clipped(presented.convert(presented.bounds, to: rootLayer), to: root.bounds)
     }
 
     /// `rect` reduced to the part of it that is inside `clip`, or nil if none of it is.
@@ -163,6 +269,7 @@ struct RedactionScanner {
     /// exposed with it, without ever being named. An escape hatch has to be narrow enough
     /// that using it is a decision about the class you actually wrote down.
     private func isExplicitlyUnmasked(_ view: UIView) -> Bool {
+        if view.mapleReplayMaskOverride == false { return true }
         guard !options.unmaskedViewClasses.isEmpty else { return false }
         let viewType = ObjectIdentifier(type(of: view))
         return options.unmaskedViewClasses.contains { ObjectIdentifier($0) == viewType }
@@ -172,7 +279,9 @@ struct RedactionScanner {
     ///
     /// Subviews' layers are excluded — they are reached by the view walk, which can apply
     /// the full masking rules to them. Only layers with no owning view are handled here.
-    private func contentLayerRects(of view: UIView, root: UIView, clip: CGRect) -> [CGRect] {
+    private func contentLayerRects(
+        of view: UIView, root: UIView, clip: CGRect, animating: Bool = false
+    ) -> [CGRect] {
         guard let sublayers = view.layer.sublayers, !sublayers.isEmpty else { return [] }
         // Subviews' layers are sublayers of their superview's layer. Skip them at any
         // depth — the view walk reaches them and can apply the full masking rules;
@@ -182,7 +291,8 @@ struct RedactionScanner {
         var result: [CGRect] = []
         for layer in sublayers {
             collectContentLayers(
-                layer, root: root, skipping: subviewLayers, clip: clip, into: &result
+                layer, root: root, skipping: subviewLayers, clip: clip,
+                animating: animating, into: &result
             )
         }
         return result
@@ -193,6 +303,7 @@ struct RedactionScanner {
         root: UIView,
         skipping subviewLayers: Set<ObjectIdentifier>,
         clip: CGRect,
+        animating: Bool = false,
         into result: inout [CGRect]
     ) {
         guard !subviewLayers.contains(ObjectIdentifier(layer)) else { return }
@@ -217,15 +328,16 @@ struct RedactionScanner {
         if layer.contents == nil, !sublayers.isEmpty {
             for sublayer in sublayers {
                 collectContentLayers(
-                    sublayer, root: root, skipping: subviewLayers, clip: subtreeClip, into: &result
+                    sublayer, root: root, skipping: subviewLayers, clip: animating ? clip : subtreeClip,
+                    animating: animating, into: &result
                 )
             }
             return
         }
 
-        if isContentBearing(layer), let visible = clipped(bounds, to: clip) {
-            result.append(visible)
-        }
+        guard isContentBearing(layer) else { return }
+        if let visible = clipped(bounds, to: clip) { result.append(visible) }
+        if animating, let presented = presentationRect(of: layer, in: root) { result.append(presented) }
     }
 
     /// Layer classes that render only decoration, never information.
@@ -246,8 +358,20 @@ struct RedactionScanner {
     }
 
     private func shouldMask(_ view: UIView) -> Bool {
+        maskDecision(view) != nil
+    }
+
+    /// Nil when the view is not masked; otherwise whether the mask is forced, meaning no
+    /// unmask region can drop it and touches over it are not recorded.
+    private func maskDecision(_ view: UIView) -> Bool? {
+        if view.mapleReplayMaskOverride == true { return true }
         if isMember(view, ofAny: options.maskedViewClasses) { return true }
         if isMember(view, ofAny: Self.alwaysMaskedTypes) { return true }
+        guard shouldMaskByContent(view) else { return nil }
+        return view is UITextInput || (view as? UITextInputTraits)?.isSecureTextEntry == true
+    }
+
+    private func shouldMaskByContent(_ view: UIView) -> Bool {
 
         // Anything the user can type into, identified structurally.
         //

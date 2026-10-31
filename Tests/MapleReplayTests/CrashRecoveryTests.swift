@@ -177,7 +177,7 @@ final class CrashRecoveryTests: XCTestCase {
             persistToDisk: true,
             onRecovered: { _ in }
         )
-        .map(\.segment.artifacts)
+        .flatMap { $0.segments.map(\.artifacts) }
     }
 
     func testRecoversAnUnfinishedSessionAsAPlayableSegment() throws {

@@ -44,6 +44,10 @@ public struct SessionMetaRow {
     let pageViews: Int
     let errorCount: Int
 
+    /// Why a recording exists when it did not start with the session. `"error"` for an
+    /// error-buffered session that a flush promoted.
+    let replayTrigger: String?
+
     init(
         sessionId: String,
         startedAt: Date,
@@ -56,7 +60,8 @@ public struct SessionMetaRow {
         traceIds: [String] = [],
         clickCount: Int = 0,
         pageViews: Int = 0,
-        errorCount: Int = 0
+        errorCount: Int = 0,
+        replayTrigger: String? = nil
     ) {
         self.sessionId = sessionId
         self.startedAt = startedAt
@@ -70,6 +75,7 @@ public struct SessionMetaRow {
         self.clickCount = clickCount
         self.pageViews = pageViews
         self.errorCount = errorCount
+        self.replayTrigger = replayTrigger
     }
 
     func json(now: Date = Date()) -> [String: Any] {
@@ -85,6 +91,11 @@ public struct SessionMetaRow {
             // packages/browser-session/src/meta-row.ts, which sends "rrweb".
             "maple.session.replay_format": "video",
         ]
+        if recorded, let replayTrigger {
+            // The recording starts up to `errorBufferWindow` before the error, not at
+            // session start. Same key the browser SDK sends.
+            resourceAttributes["maple.session.replay_trigger"] = replayTrigger
+        }
         if let environment {
             // Dual-emit: the legacy key is pre-extracted by the Tinybird MVs, the
             // canonical one is the OTel semconv name.
@@ -146,7 +157,9 @@ public struct SessionMetaRow {
 
     /// One NDJSON line, newline-terminated — the exact body of the meta POST.
     func ndjson(now: Date = Date()) throws -> Data {
-        var data = try JSONSerialization.data(withJSONObject: json(now: now), options: [.sortedKeys])
+        let object = json(now: now)
+        guard JSONSerialization.isValidJSONObject(object) else { throw SegmentWriterError.invalidJSON }
+        var data = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
         data.append(0x0A)
         return data
     }
@@ -175,12 +188,19 @@ public struct SessionMetaRow {
 
     /// ClickHouse `DateTime64(3)` literal: `YYYY-MM-DD HH:MM:SS.mmm`, always UTC.
     static func clickHouseDateTime(_ date: Date) -> String {
+        dateTimeFormatter.string(from: date)
+    }
+
+    /// Built once: a `DateFormatter` costs more to make than to use, and this runs for
+    /// every distilled event. Formatting is thread-safe on every supported iOS.
+    private static let dateTimeFormatter: DateFormatter = {
         let formatter = DateFormatter()
+        formatter.calendar = Calendar(identifier: .gregorian)
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.timeZone = TimeZone(secondsFromGMT: 0)
         formatter.dateFormat = "yyyy-MM-dd HH:mm:ss.SSS"
-        return formatter.string(from: date)
-    }
+        return formatter
+    }()
 
     static func deviceType() -> String {
         switch UIDevice.current.userInterfaceIdiom {

@@ -2,40 +2,70 @@ import Foundation
 import MapleCore
 import UIKit
 
+/// One observed touch, in window points.
+struct TouchSample: Equatable {
+    let timestamp: Date
+    let interaction: TouchInteraction
+    let location: CGPoint
+}
+
 /// Records touch locations so the replay shows where the user tapped.
 ///
 /// Non-obvious but essential: a screenshot-based replay has no cursor and no visible
 /// press state, so without this the video shows screens changing for no apparent reason.
-/// Sentry ships the same component for the same reason.
 final class TouchTracker {
     private let lock = NSLock()
-    private var events: [RRWebEvent] = []
-    /// Bounded so a long buffered window can't accumulate touches without limit.
-    private let maxEvents = 2_000
+    private var samples: [TouchSample] = []
+    private var lastMoveAt = Date.distantPast
 
-    func record(interaction: TouchInteraction, at point: CGPoint) {
-        let event = RRWebEvent.touch(
-            timestamp: Date(), interaction: interaction, x: point.x, y: point.y
-        )
+    /// Bounded so a long buffered window can't accumulate touches without limit.
+    let maxSamples: Int
+    /// Moves arrive at the display rate (120 Hz on ProMotion). A trail at 10 Hz is all a
+    /// replay at 1 fps can show, and every sample is bytes in every segment.
+    static let moveInterval: TimeInterval = 0.1
+
+    init(maxSamples: Int = 2_000) {
+        self.maxSamples = max(1, maxSamples)
+    }
+
+    func record(interaction: TouchInteraction, at point: CGPoint, now: Date = Date()) {
+        guard point.x.isFinite, point.y.isFinite else { return }
         lock.lock()
-        events.append(event)
-        if events.count > maxEvents { events.removeFirst(events.count - maxEvents) }
+        defer { lock.unlock() }
+        if interaction == .touchMove {
+            guard now.timeIntervalSince(lastMoveAt) >= Self.moveInterval else { return }
+            lastMoveAt = now
+        }
+        samples.append(TouchSample(timestamp: now, interaction: interaction, location: point))
+        if samples.count > maxSamples { samples.removeFirst(samples.count - maxSamples) }
+    }
+
+    /// Touches at or before `end`, removed from the tracker. Anything older than
+    /// `notBefore` is discarded rather than returned.
+    func drain(until end: Date, notBefore start: Date = .distantPast) -> [TouchSample] {
+        lock.lock()
+        defer { lock.unlock() }
+        let matching = samples.filter { $0.timestamp <= end && $0.timestamp >= start }
+        samples.removeAll { $0.timestamp <= end }
+        return matching
+    }
+
+    /// Forget touches older than `cutoff`. Called as the buffer evicts frames, so a
+    /// buffered session holds touches for the same window it holds video.
+    func discard(olderThan cutoff: Date) {
+        lock.lock()
+        samples.removeAll { $0.timestamp < cutoff }
         lock.unlock()
     }
 
-    /// Touches within a time range, and drop everything at or before its end.
-    func drain(until end: Date) -> [RRWebEvent] {
-        let cutoff = end.epochMilliseconds
-        lock.lock()
-        defer { lock.unlock() }
-        let matching = events.filter { $0.timestamp <= cutoff }
-        events.removeAll { $0.timestamp <= cutoff }
-        return matching
+    var count: Int {
+        lock.lock(); defer { lock.unlock() }
+        return samples.count
     }
 
     func removeAll() {
         lock.lock()
-        events.removeAll()
+        samples.removeAll()
         lock.unlock()
     }
 }
@@ -44,22 +74,32 @@ final class TouchTracker {
 ///
 /// A `UIGestureRecognizer` with `cancelsTouchesInView = false` and
 /// `delaysTouchesBegan/Ended = false` observes every touch while remaining invisible to
-/// the app's own gesture handling. Swizzling `sendEvent:` would also work and is what
-/// several SDKs do, but it mutates a UIKit class the host app also owns — an
-/// unnecessary risk for a capability a recognizer already provides.
+/// the app's own gesture handling. Swizzling `sendEvent:` would also work, but it
+/// mutates a UIKit class the host app also owns.
 final class TouchObserver: NSObject, UIGestureRecognizerDelegate {
     private weak var window: UIWindow?
-    private var recognizer: UIGestureRecognizer?
+    private var recognizer: PassthroughGestureRecognizer?
     private let tracker: TouchTracker
+    private let recordLocations: Bool
 
-    init(tracker: TouchTracker) {
+    /// Regions the last capture masked, in window points. Main thread only.
+    ///
+    /// A touch's position is as revealing as the pixels under it: taps on a custom PIN
+    /// pad spell the PIN even when every digit is masked. So a touch inside a masked
+    /// region keeps counting as a click but its location is never recorded. The rects
+    /// are up to one capture interval old; the view under the finger is checked live.
+    var maskedRegions: [CGRect] = []
+
+    init(tracker: TouchTracker, recordLocations: Bool = true) {
         self.tracker = tracker
+        self.recordLocations = recordLocations
     }
 
     @MainActor
     func attach(to window: UIWindow) {
+        guard window !== self.window || recognizer == nil else { return }
         detach()
-        let recognizer = PassthroughGestureRecognizer(tracker: tracker)
+        let recognizer = PassthroughGestureRecognizer(observer: self)
         recognizer.delegate = self
         recognizer.cancelsTouchesInView = false
         recognizer.delaysTouchesBegan = false
@@ -76,18 +116,38 @@ final class TouchObserver: NSObject, UIGestureRecognizerDelegate {
         window = nil
     }
 
-    /// Never block another recognizer — this one only observes.
+    var attachedWindow: UIWindow? { window }
+
+    /// Never block another recognizer: this one only observes.
     func gestureRecognizer(
         _ gestureRecognizer: UIGestureRecognizer,
         shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer
     ) -> Bool { true }
+
+    fileprivate func report(_ touch: UITouch, in window: UIView, as interaction: TouchInteraction) {
+        guard recordLocations else { return }
+        let point = touch.location(in: window)
+        guard !isSensitive(point: point, touchedView: touch.view) else { return }
+        tracker.record(interaction: interaction, at: point)
+    }
+
+    /// Whether a touch at `point` must not be recorded.
+    func isSensitive(point: CGPoint, touchedView: UIView?) -> Bool {
+        if maskedRegions.contains(where: { $0.contains(point) }) { return true }
+        var view = touchedView
+        while let current = view {
+            if current is UITextInput || current.mapleReplayMaskOverride == true { return true }
+            view = current.superview
+        }
+        return false
+    }
 }
 
 private final class PassthroughGestureRecognizer: UIGestureRecognizer {
-    private let tracker: TouchTracker
+    private weak var observer: TouchObserver?
 
-    init(tracker: TouchTracker) {
-        self.tracker = tracker
+    init(observer: TouchObserver) {
+        self.observer = observer
         super.init(target: nil, action: nil)
     }
 
@@ -96,8 +156,8 @@ private final class PassthroughGestureRecognizer: UIGestureRecognizer {
         // Counted on *began* rather than ended, so a tap that turns into a scroll still
         // counts as an interaction. `ClickCount` is a liveness signal, not a tap total.
         SessionSink.shared.recordClick()
-        // Stay in .possible forever so the recognizer never fires, never transitions to
-        // .began, and therefore never interferes with the app's gestures.
+        // Stay in .possible forever so the recognizer never fires and never interferes
+        // with the app's gestures.
         state = .possible
     }
 
@@ -115,6 +175,6 @@ private final class PassthroughGestureRecognizer: UIGestureRecognizer {
 
     private func report(_ touches: Set<UITouch>, as interaction: TouchInteraction) {
         guard let touch = touches.first, let view = self.view else { return }
-        tracker.record(interaction: interaction, at: touch.location(in: view))
+        observer?.report(touch, in: view, as: interaction)
     }
 }

@@ -11,18 +11,22 @@ import UIKit
 /// ```swift
 /// var options = ReplayOptions()
 /// options.ingestKey = "maple_pk_…"
-/// options.flushPolicy = .buffered(window: 30)
+/// options.sessionSampleRate = 0.1   // record 10% of sessions from the start
+/// options.onErrorSampleRate = 1     // and keep the last 30 s of the rest for errors
 /// MapleReplay.shared.start(options: options, serviceName: "my-app")
 /// // ... later, on an error:
 /// MapleReplay.shared.flush(trigger: "error")
 /// ```
 ///
-/// Sessions end when the app goes to the background, and a new one begins when it comes
-/// back. That is not a policy choice so much as the shape of the platform: there is no
-/// `keepalive` and no unload event, so backgrounding is the last moment an `ended` row
-/// can be sent at all, and a session that reported itself ended must not keep recording
-/// under the same id.
-public final class MapleReplay {
+/// Backgrounding pauses the session: the tail is flushed and an `ended` row posted,
+/// because there is no `keepalive` and no unload event, so it is the last moment anything
+/// can be sent. Coming back within `backgroundSessionTimeout` resumes the same session
+/// (with a fresh `active` row that supersedes the `ended` one); later than that starts a
+/// new one.
+///
+/// Every public method is safe to call from any thread, except `start` and `stop`, which
+/// are main-actor isolated.
+public final class MapleReplay: @unchecked Sendable {
     public static let shared = MapleReplay()
 
     /// Everything `start()` was given, kept so a session can be re-established when the
@@ -32,51 +36,98 @@ public final class MapleReplay {
         let ingestKey: String
         let serviceName: String
         let environment: String?
-        let userId: String
+        var userId: String
     }
 
+    /// One session, across however many capture runs its foreground stints take.
+    private final class Session {
+        let id: String
+        let startedAt: Date
+        var mode: ReplayMode
+        let transport: ReplayTransport
+        let sequencer = ChunkSequencer()
+        /// Last metadata row version posted. The table keeps the highest, so every row
+        /// takes the next one; the first is 1, which is the one ingest bills.
+        var metaVersion = 0
+        var run = 0
+        var replayTrigger: String?
+        var eventSeq = 0
+        var pendingEvents: [SessionEventRow] = []
+        /// Set while the app is in the background.
+        var pausedAt: Date?
+
+        init(id: String, startedAt: Date, mode: ReplayMode, transport: ReplayTransport) {
+            self.id = id
+            self.startedAt = startedAt
+            self.mode = mode
+            self.transport = transport
+        }
+
+        func nextVersion() -> Int {
+            metaVersion += 1
+            return metaVersion
+        }
+    }
+
+    /// Guards every property below it. Taken briefly and never across a call out of this
+    /// class, so a host callback can never deadlock against it.
+    private let lock = NSLock()
     private var configuration: Configuration?
+    private var session: Session?
     private var recorder: ReplayRecorder?
-    private var metaRow: SessionMetaRow?
-    private var sessionDirectory: URL?
-    private(set) public var sessionId: String?
+    private var lifecycleObservers: [NSObjectProtocol] = []
 
     /// Called on the main thread each time a segment is produced.
     ///
     /// Segments recovered from a previous session's crash arrive here too, shortly after
     /// `start()`. They carry a `replay.crash_recovery` breadcrumb and belong to the
     /// crashed session's id, not the current one.
-    public var onSegment: ((SegmentArtifacts) -> Void)?
+    public var onSegment: ((SegmentArtifacts) -> Void)? {
+        get { locked { onSegmentHandler } }
+        set { locked { onSegmentHandler = newValue } }
+    }
+    private var onSegmentHandler: ((SegmentArtifacts) -> Void)?
 
     private let recoveryQueue = DispatchQueue(label: "dev.maple.replay.recovery", qos: .utility)
-    private var lifecycleObservers: [NSObjectProtocol] = []
-
-    /// Guards the state `track(_:properties:)` touches, since a host app calls it from
-    /// wherever its own code happens to be.
-    private let eventLock = NSLock()
-    private var transport: ReplayTransport?
-    private var pendingEvents: [SessionEventRow] = []
-    private var eventSeq = 0
+    /// Crash recovery runs once per process. A `stop()` then `start()` would otherwise
+    /// find the stopped run's spool mid-deletion and upload its tail a second time.
+    private var didRecover = false
 
     /// Distilled events are batched rather than sent one request per `track()`. Flushed
     /// on every segment boundary and at session end, so this only bounds a burst.
-    private static let maxBufferedEvents = 64
+    static let maxBufferedEvents = 64
 
     /// How long a background task will be held open waiting for the final flush. The OS
     /// terminates an app that overruns its background time, so this is deliberately well
     /// inside the budget iOS actually grants.
-    private static let backgroundFlushTimeout: TimeInterval = 8
+    static let backgroundFlushTimeout: TimeInterval = 8
 
-    private init() {}
+    /// Test seam for the transport's `URLSession`. Production never sets it.
+    var urlSessionOverride: URLSession?
+    /// Test seam for the sampling roll.
+    var randomSource: () -> Double = { Double.random(in: 0..<1) }
 
-    public var isRecording: Bool { recorder != nil }
+    init() {}
+
+    /// The live session's id. `nil` before `start()`, after `stop()`, and while the app
+    /// is in the background.
+    public var sessionId: String? {
+        locked { session?.pausedAt == nil ? session?.id : nil }
+    }
+
+    /// Whether frames are being captured right now. False for a session the sampling
+    /// decided not to record, which still exists for spans and events.
+    public var isRecording: Bool { locked { recorder != nil } }
 
     /// Directory the current session's segments are written to, when
     /// `ReplayOptions.writeSegmentsToDisk` is on.
-    public var outputDirectory: URL? { recorder?.outputDirectory }
+    public var outputDirectory: URL? { locked { recorder?.outputDirectory } }
 
-    /// Segments produced so far this session.
-    public var segments: [SegmentArtifacts] { recorder?.artifacts ?? [] }
+    /// Segments produced so far by the current capture run.
+    public var segments: [SegmentArtifacts] { locked { recorder?.artifacts ?? [] } }
+
+    /// What the live session records, for tests and diagnostics.
+    var currentMode: ReplayMode? { locked { session?.mode } }
 
     // MARK: - Public lifecycle
 
@@ -93,7 +144,7 @@ public final class MapleReplay {
         environment: String? = nil,
         userId: String = ""
     ) {
-        guard recorder == nil else { return }
+        guard locked({ configuration == nil }) else { return }
 
         if let problem = ReplayTransport.validate(ingestKey: options.ingestKey) {
             NSLog("[MapleReplay] not recording — \(problem)")
@@ -108,38 +159,65 @@ public final class MapleReplay {
             NSLog("[MapleReplay] using the gateway's sentinel key: requests will be accepted and discarded, and no session will appear.")
         }
 
-        configuration = Configuration(
-            options: options,
-            ingestKey: ingestKey,
-            serviceName: serviceName,
-            environment: environment,
-            userId: userId
-        )
+        let normalized = options.normalized()
+        locked {
+            configuration = Configuration(
+                options: normalized,
+                ingestKey: ingestKey,
+                serviceName: serviceName,
+                environment: environment,
+                userId: userId
+            )
+        }
         installLifecycleObservers()
         beginSession()
 
         // Once per launch, not once per session: a foreground/background cycle must not
         // re-scan for spools, and by then the only spool present is the live one.
-        recoverPreviousSessions(options: options, activeSessionId: sessionId)
+        recoverPreviousSessions(options: normalized, ingestKey: ingestKey)
     }
 
     /// Stop recording, flush the tail, and close the session out.
     @MainActor
     public func stop() {
-        configuration = nil
         removeLifecycleObservers()
-        endSession(reason: "stop")
+        let retired: Session? = locked {
+            configuration = nil
+            return session
+        }
+        guard let retired else { return }
+        pauseSession(reason: "stop") { [weak self] in
+            self?.discard(retired)
+        }
     }
 
     /// Emit whatever is currently buffered.
     ///
-    /// In `.buffered` mode this is the only thing that produces a segment — wire it to
-    /// your error handler. In `.continuous` mode it forces an early segment boundary.
+    /// In an error-buffered session this uploads the last `errorBufferWindow` seconds
+    /// and records continuously from then on: wire it to your error handler. In a
+    /// recorded session it forces an early segment boundary.
     public func flush(trigger: String = "manual") {
-        recorder?.flush(trigger: trigger)
+        let action: (recorder: ReplayRecorder, promote: Bool, segment: TimeInterval)? = locked {
+            guard let session, session.pausedAt == nil, let recorder, let configuration else { return nil }
+            let promote = session.mode == .buffer
+            if promote {
+                session.mode = .record
+                session.replayTrigger = "error"
+            }
+            return (recorder, promote, configuration.options.segmentDuration)
+        }
+        guard let action else { return }
+        if action.promote {
+            // The row first: the session must read as recorded before its first chunk
+            // lands, or the UI briefly labels a playable session "Not recorded".
+            postMeta(status: .active)
+            action.recorder.promote(to: action.segment, trigger: trigger)
+        } else {
+            action.recorder.flush(trigger: trigger)
+        }
     }
 
-    /// Record a distilled `custom` session event — the mobile equivalent of the browser
+    /// Record a distilled `custom` session event: the mobile equivalent of the browser
     /// SDK's `track(name, props)`.
     ///
     /// Buffered and sent with the next segment rather than immediately: one request per
@@ -148,190 +226,269 @@ public final class MapleReplay {
         enqueue(SessionEventDraft(kind: .custom, message: name, attributes: properties))
     }
 
+    /// Attach a user id to the session, typically right after sign-in.
+    ///
+    /// Posts a fresh `active` row so the id is searchable while the session is still
+    /// live, and carries over to later sessions until changed. Pass `""` on sign-out.
+    public func setUserId(_ userId: String) {
+        let changed: Bool = locked {
+            guard configuration != nil, configuration?.userId != userId else { return false }
+            configuration?.userId = userId
+            return session?.pausedAt == nil && session != nil
+        }
+        if changed { postMeta(status: .active) }
+    }
+
     /// Buffer a distilled event, whoever raised it.
     ///
-    /// `MapleTracing` raises `network` and `navigation` events through
-    /// `SessionSink`'s relay; `track()` raises `custom` ones. They share one `Seq`
-    /// counter because `Seq` is in the table's sorting key and two independent counters
-    /// would interleave two event streams at the same ordinal.
+    /// `MapleTracing` raises `network` and `navigation` events through `SessionSink`'s
+    /// relay; `track()` raises `custom` ones. They share one `Seq` counter because `Seq`
+    /// is in the table's sorting key and two independent counters would interleave two
+    /// event streams at the same ordinal.
     func enqueue(_ draft: SessionEventDraft) {
-        eventLock.lock()
-        guard let sessionId, let transport else { eventLock.unlock(); return }
-        pendingEvents.append(SessionEventRow(sessionId: sessionId, seq: eventSeq, draft: draft))
-        eventSeq += 1
-        let batch = pendingEvents.count >= Self.maxBufferedEvents ? takePendingEventsLocked() : []
-        eventLock.unlock()
-
-        if !batch.isEmpty { transport.postEvents(batch) }
+        let send: (ReplayTransport, [SessionEventRow])? = locked {
+            guard let session, session.pausedAt == nil else { return nil }
+            session.pendingEvents.append(SessionEventRow(sessionId: session.id, seq: session.eventSeq, draft: draft))
+            session.eventSeq += 1
+            guard session.pendingEvents.count >= Self.maxBufferedEvents else { return nil }
+            return (session.transport, takeEvents(session))
+        }
+        if let send { send.0.postEvents(send.1) }
     }
 
     // MARK: - Sessions
 
     @MainActor
     private func beginSession() {
-        guard let configuration, recorder == nil else { return }
+        let created: Session? = locked {
+            guard let configuration, session == nil else { return nil }
+            // The gateway rejects ids outside `[A-Za-z0-9_-]{1,128}`, and the id must be
+            // lowercase to survive the backend's public-id round trip. See
+            // `SegmentWriter.newSessionId()`.
+            let id = SegmentWriter.newSessionId()
+            precondition(SegmentWriter.isSafeSessionId(id), "generated session id is not gateway-safe")
+            let transport = ReplayTransport(
+                endpoint: configuration.options.endpoint,
+                ingestKey: configuration.ingestKey,
+                sessionId: id,
+                urlSession: urlSessionOverride
+            )
+            let created = Session(
+                id: id,
+                startedAt: Date(),
+                mode: ReplayMode.roll(configuration.options, random: randomSource),
+                transport: transport
+            )
+            session = created
+            return created
+        }
+        guard let created else { return }
+        activate(created)
+    }
 
-        // The gateway rejects ids outside `[A-Za-z0-9_-]{1,128}`. A bare uuidString
-        // qualifies; anything with braces or colons would 400 at upload time. It must
-        // also be lowercase to survive the backend's public-id round trip — see
-        // `SegmentWriter.newSessionId()`.
-        let id = SegmentWriter.newSessionId()
-        precondition(SegmentWriter.isSafeSessionId(id), "generated session id is not gateway-safe")
-        sessionId = id
-
-        let startedAt = Date()
-        let transport = ReplayTransport(
-            endpoint: configuration.options.endpoint,
-            ingestKey: configuration.ingestKey,
-            sessionId: id
-        )
-
-        eventLock.lock()
-        self.transport = transport
-        pendingEvents.removeAll()
-        eventSeq = 0
-        eventLock.unlock()
-
+    /// Publish a session, announce it, and start capturing if it is sampled. Shared by a
+    /// new session and one resumed from the background.
+    @MainActor
+    private func activate(_ session: Session) {
         // Publish before the recorder starts. Every span created from here on carries
         // this id as its `session.id` attribute, and every trace id it sees is collected
-        // for the `ended` row — the two directions of the session/trace join.
-        SessionSink.shared.publish(sessionId: id)
+        // for the `ended` row: the two directions of the session/trace join.
+        SessionSink.shared.publish(sessionId: session.id)
         SessionSink.shared.setEventRelay { [weak self] draft in
             self?.enqueue(draft)
         }
-
-        let recorder = ReplayRecorder(
-            sessionId: id,
-            options: configuration.options,
-            startedAt: startedAt,
-            serviceName: configuration.serviceName,
-            environment: configuration.environment,
-            userId: configuration.userId
-        )
-        // Runs on the recorder's work queue. Upload starts here, from that queue —
-        // there is no reason to bounce a finished chunk through the main thread first.
-        recorder.onSegment = { [weak self] segment in
-            transport.postBlob(segment)
-            self?.flushPendingEvents(using: transport)
-            DispatchQueue.main.async { self?.onSegment?(segment.artifacts) }
-        }
-        self.recorder = recorder
-        sessionDirectory = recorder.outputDirectory
-
-        let meta = SessionMetaRow(
-            sessionId: id,
-            startedAt: startedAt,
-            status: .active,
-            version: 1,
-            serviceName: configuration.serviceName,
-            environment: configuration.environment,
-            userId: configuration.userId,
-            recorded: true
-        )
-        metaRow = meta
-        deliver(
-            meta,
-            using: transport,
-            directory: configuration.options.writeSegmentsToDisk ? recorder.outputDirectory : nil
-        )
-
-        recorder.start()
+        postMeta(status: .active)
+        startCaptureRun(for: session)
     }
 
-    /// Flush the tail, post the `ended` row, and tear the session down.
-    ///
-    /// `completion` runs once every request the teardown started has finished or timed
-    /// out — which is what lets the background transition hold a background task open for
-    /// exactly as long as it needs.
     @MainActor
-    private func endSession(reason: String, completion: (() -> Void)? = nil) {
-        guard let recorder, let transport else { completion?(); return }
-        let meta = metaRow
-        let directory = sessionDirectory
-        let options = configuration?.options
+    private func startCaptureRun(for session: Session) {
+        let recorder: ReplayRecorder? = locked {
+            guard let configuration, session.mode != .off, self.session === session, self.recorder == nil else {
+                return nil
+            }
+            let options = configuration.options
+            let recorder = ReplayRecorder(
+                sessionId: session.id,
+                options: options,
+                capture: session.mode == .buffer
+                    ? .buffered(window: options.errorBufferWindow)
+                    : .continuous(segmentDuration: options.segmentDuration),
+                sequencer: session.sequencer,
+                run: session.run,
+                mode: session.mode,
+                startedAt: session.startedAt,
+                serviceName: configuration.serviceName,
+                environment: configuration.environment,
+                userId: configuration.userId
+            )
+            let transport = session.transport
+            // Runs on the recorder's work queue. Upload starts here, from that queue:
+            // there is no reason to bounce a finished chunk through the main thread first.
+            recorder.onSegment = { [weak self] segment in
+                transport.postBlob(segment)
+                self?.flushEvents(of: session)
+                DispatchQueue.main.async { self?.onSegment?(segment.artifacts) }
+            }
+            self.recorder = recorder
+            return recorder
+        }
+        recorder?.start()
+    }
 
-        self.recorder = nil
-        self.metaRow = nil
-        self.sessionDirectory = nil
-        self.sessionId = nil
-        eventLock.lock()
-        self.transport = nil
-        let trailingEvents = takePendingEventsLocked()
-        eventLock.unlock()
+    /// Flush the tail, post the `ended` row, and stop capturing. The session itself is
+    /// kept so the app coming back can resume it.
+    ///
+    /// `completion` runs on the main thread once every request the teardown started has
+    /// finished or timed out, which is what lets the background transition hold a
+    /// background task open for exactly as long as it needs.
+    @MainActor
+    private func pauseSession(reason: String, completion: (() -> Void)? = nil) {
+        let state: (Session, ReplayRecorder?, [SessionEventRow])? = locked {
+            guard let session, session.pausedAt == nil else { return nil }
+            session.pausedAt = Date()
+            let retiring = recorder
+            recorder = nil
+            return (session, retiring, takeEvents(session))
+        }
+        guard let (session, retiring, trailingEvents) = state else { completion?(); return }
+
         SessionSink.shared.publish(sessionId: nil)
         SessionSink.shared.setEventRelay(nil)
+        let transport = session.transport
 
-        // `retiring` is captured by the completion closure, which the work queue holds
-        // until it runs. Without that the recorder would deallocate the moment the
-        // property above was cleared, and the final flush — the tail of the session,
-        // usually the part someone actually wants — would never be emitted.
-        let retiring = recorder
-        retiring.flush(trigger: reason) { [weak self] in
-            _ = retiring
+        let finish: () -> Void = { [weak self] in
             if !trailingEvents.isEmpty { transport.postEvents(trailingEvents) }
-            if let meta {
-                let counters = SessionSink.shared.counters(for: meta.sessionId)
-                let ended = SessionMetaRow(
-                    sessionId: meta.sessionId,
-                    startedAt: meta.startedAt,
-                    status: .ended,
-                    version: 2,
-                    serviceName: meta.serviceName,
-                    environment: meta.environment,
-                    userId: meta.userId,
-                    recorded: true,
-                    traceIds: SessionSink.shared.observedTraceIds(for: meta.sessionId),
-                    clickCount: counters.clickCount,
-                    pageViews: counters.pageViews,
-                    errorCount: counters.errorCount
-                )
-                self?.deliver(
-                    ended,
-                    using: transport,
-                    directory: options?.writeSegmentsToDisk == true ? directory : nil
-                )
-            }
-            if let meta { SessionSink.shared.discard(sessionId: meta.sessionId) }
+            self?.postMeta(status: .ended, for: session)
             transport.awaitPending(timeout: Self.backgroundFlushTimeout) {
                 DispatchQueue.main.async { completion?() }
             }
         }
+
+        guard let retiring else { finish(); return }
+        // An error-buffered session uploads only for an error, and leaving the app is
+        // not one: its window is dropped with the run.
+        if session.mode == .buffer {
+            retiring.stop()
+            finish()
+            return
+        }
+        // `retiring` is captured by the completion closure, which the work queue holds
+        // until it runs. Without that the recorder would deallocate the moment the
+        // property above was cleared, and the final flush (the tail of the session,
+        // usually the part someone actually wants) would never be emitted.
+        retiring.flush(trigger: reason) {
+            _ = retiring
+            finish()
+        }
         retiring.stop()
     }
 
-    /// Post a metadata row, and mirror it to `meta.ndjson` when disk output is on.
+    /// Bring a paused session back, or replace it if it was away too long.
+    @MainActor
+    private func resumeOrRotate() {
+        let decision: (resume: Session?, expired: Session?) = locked {
+            guard let configuration, let session, let pausedAt = session.pausedAt else { return (nil, nil) }
+            let away = Date().timeIntervalSince(pausedAt)
+            if away >= 0, away < configuration.options.backgroundSessionTimeout {
+                session.pausedAt = nil
+                session.run += 1
+                return (session, nil)
+            }
+            self.session = nil
+            return (nil, session)
+        }
+        if let resumed = decision.resume {
+            activate(resumed)
+        } else {
+            if let expired = decision.expired { SessionSink.shared.discard(sessionId: expired.id) }
+            beginSession()
+        }
+    }
+
+    private func discard(_ retired: Session) {
+        locked {
+            if session === retired { session = nil }
+        }
+        SessionSink.shared.discard(sessionId: retired.id)
+    }
+
+    // MARK: - Metadata
+
+    /// Post a metadata row for the live session, or for `target` when it is given.
     ///
     /// The row is the **billed** unit and the only thing that makes a session appear in
-    /// the UI — blobs are not metered. An SDK that uploads chunks and never posts one
+    /// the UI; blobs are not metered. An SDK that uploads chunks and never posts one
     /// bills nothing and records into a void.
-    private func deliver(_ meta: SessionMetaRow, using transport: ReplayTransport, directory: URL?) {
+    private func postMeta(status: SessionMetaRow.Status, for target: Session? = nil) {
+        let built: (SessionMetaRow, ReplayTransport, URL?)? = locked {
+            guard let session = target ?? session, let configuration else {
+                // After `stop()` the configuration is gone but the closing row is still
+                // owed, so fall back to what the row was last built from.
+                guard let target, let last = lastConfiguration else { return nil }
+                return build(status: status, session: target, configuration: last)
+            }
+            lastConfiguration = configuration
+            return build(status: status, session: session, configuration: configuration)
+        }
+        guard let (row, transport, directory) = built else { return }
         let now = Date()
-        transport.postMeta(meta, now: now)
-        if let directory { meta.append(to: directory, now: now) }
+        transport.postMeta(row, now: now)
+        if let directory { row.append(to: directory, now: now) }
     }
+
+    /// Caller holds `lock`.
+    private func build(
+        status: SessionMetaRow.Status,
+        session: Session,
+        configuration: Configuration
+    ) -> (SessionMetaRow, ReplayTransport, URL?) {
+        let counters = SessionSink.shared.counters(for: session.id)
+        let row = SessionMetaRow(
+            sessionId: session.id,
+            startedAt: session.startedAt,
+            status: status,
+            version: session.nextVersion(),
+            serviceName: configuration.serviceName,
+            environment: configuration.environment,
+            userId: configuration.userId,
+            recorded: session.mode == .record,
+            traceIds: status == .ended ? SessionSink.shared.observedTraceIds(for: session.id) : [],
+            clickCount: counters.clickCount,
+            pageViews: counters.pageViews,
+            errorCount: counters.errorCount,
+            replayTrigger: session.replayTrigger
+        )
+        let directory = configuration.options.writeSegmentsToDisk
+            ? ReplayRecorder.rootDirectory(options: configuration.options)
+                .appendingPathComponent(session.id, isDirectory: true)
+            : nil
+        return (row, session.transport, directory)
+    }
+
+    private var lastConfiguration: Configuration?
 
     // MARK: - Distilled events
 
-    private func flushPendingEvents(using transport: ReplayTransport) {
-        eventLock.lock()
-        let batch = takePendingEventsLocked()
-        eventLock.unlock()
-        if !batch.isEmpty { transport.postEvents(batch) }
+    private func flushEvents(of session: Session) {
+        let batch = locked { takeEvents(session) }
+        if !batch.isEmpty { session.transport.postEvents(batch) }
     }
 
-    /// Caller must hold `eventLock`.
-    private func takePendingEventsLocked() -> [SessionEventRow] {
-        defer { pendingEvents.removeAll(keepingCapacity: true) }
-        return pendingEvents
+    /// Caller holds `lock`.
+    private func takeEvents(_ session: Session) -> [SessionEventRow] {
+        defer { session.pendingEvents.removeAll(keepingCapacity: true) }
+        return session.pendingEvents
     }
 
     // MARK: - App lifecycle
     //
     // There is no `keepalive` and no unload beacon on iOS. Backgrounding is the last
     // point at which anything can be sent, and the app can be suspended the instant the
-    // notification handlers return — so the final flush runs inside a `UIApplication`
+    // notification handlers return, so the final flush runs inside a `UIApplication`
     // background task, which is the only thing that buys the requests time to complete.
 
+    @MainActor
     private func installLifecycleObservers() {
         guard lifecycleObservers.isEmpty else { return }
         let center = NotificationCenter.default
@@ -341,7 +498,7 @@ public final class MapleReplay {
                 object: nil,
                 queue: .main
             ) { [weak self] _ in
-                Task { @MainActor in self?.handleDidEnterBackground() }
+                MainActor.assumeIsolated { self?.handleDidEnterBackground() }
             }
         )
         lifecycleObservers.append(
@@ -350,11 +507,12 @@ public final class MapleReplay {
                 object: nil,
                 queue: .main
             ) { [weak self] _ in
-                Task { @MainActor in self?.handleWillEnterForeground() }
+                MainActor.assumeIsolated { self?.handleWillEnterForeground() }
             }
         )
     }
 
+    @MainActor
     private func removeLifecycleObservers() {
         for observer in lifecycleObservers {
             NotificationCenter.default.removeObserver(observer)
@@ -362,9 +520,10 @@ public final class MapleReplay {
         lifecycleObservers.removeAll()
     }
 
+    /// Internal so tests can drive the lifecycle without a real app transition.
     @MainActor
-    private func handleDidEnterBackground() {
-        guard recorder != nil else { return }
+    func handleDidEnterBackground() {
+        guard locked({ session != nil && session?.pausedAt == nil }) else { return }
 
         let application = UIApplication.shared
         var identifier = UIBackgroundTaskIdentifier.invalid
@@ -378,7 +537,7 @@ public final class MapleReplay {
             }
         }
 
-        endSession(reason: "background") {
+        pauseSession(reason: "background") {
             if identifier != .invalid {
                 application.endBackgroundTask(identifier)
                 identifier = .invalid
@@ -387,33 +546,41 @@ public final class MapleReplay {
     }
 
     @MainActor
-    private func handleWillEnterForeground() {
-        // Only if `start()` is still in force and the background transition is what ended
-        // the session. An explicit `stop()` clears the configuration, and stays stopped.
-        guard configuration != nil, recorder == nil else { return }
-        beginSession()
+    func handleWillEnterForeground() {
+        // Only if `start()` is still in force. An explicit `stop()` clears the
+        // configuration, and stays stopped.
+        guard locked({ configuration != nil }) else { return }
+        if locked({ session == nil }) {
+            beginSession()
+        } else {
+            resumeOrRotate()
+        }
     }
 
     // MARK: - Crash recovery
 
     /// Encode, emit, and upload anything a previous session left spooled when it died.
     ///
-    /// Deliberately after `recorder.start()`: recovery decodes and re-encodes up to a
-    /// full window, and the current session's capture is the thing that must not wait.
-    /// It also runs off the main thread — this is app launch, the worst possible place
-    /// to spend hundreds of milliseconds.
-    private func recoverPreviousSessions(options: ReplayOptions, activeSessionId: String?) {
-        guard options.crashRecovery, let configuration else { return }
+    /// Deliberately after the live session started: recovery decodes and re-encodes up to
+    /// a full window, and the current session's capture is the thing that must not wait.
+    /// It also runs off the main thread, because this is app launch.
+    private func recoverPreviousSessions(options: ReplayOptions, ingestKey: String) {
+        let activeSessionId: String? = locked {
+            guard options.crashRecovery, !didRecover else { return nil }
+            didRecover = true
+            return session?.id ?? ""
+        }
+        guard let activeSessionId else { return }
         let root = ReplayRecorder.rootDirectory(options: options)
         let limits = CrashRecovery.Limits(totalByteBudget: options.maxTotalSpoolBytes)
         let endpoint = options.endpoint
-        let ingestKey = configuration.ingestKey
         let persistToDisk = options.writeSegmentsToDisk
+        let urlSession = urlSessionOverride
 
         recoveryQueue.async { [weak self] in
             CrashRecovery.recoverPendingSessions(
                 root: root,
-                activeSessionId: activeSessionId,
+                activeSessionId: activeSessionId.isEmpty ? nil : activeSessionId,
                 limits: limits,
                 persistToDisk: persistToDisk
             ) { recovered in
@@ -423,14 +590,15 @@ public final class MapleReplay {
                 let transport = ReplayTransport(
                     endpoint: endpoint,
                     ingestKey: ingestKey,
-                    sessionId: recovered.sessionId
+                    sessionId: recovered.sessionId,
+                    urlSession: urlSession
                 )
-                transport.postBlob(recovered.segment)
-                // The crashed session posted its `active` row at its own start, so this
-                // `ended` row is all that is missing. Its time is the last frame captured,
-                // not the moment of recovery.
+                for segment in recovered.segments {
+                    transport.postBlob(segment)
+                    DispatchQueue.main.async { self?.onSegment?(segment.artifacts) }
+                }
+                // Its time is the last frame captured, not the moment of recovery.
                 transport.postMeta(recovered.endedRow, now: recovered.endedAt)
-                DispatchQueue.main.async { self?.onSegment?(recovered.segment.artifacts) }
 
                 // Recovery runs on a serial queue and this is the last use of the
                 // transport, so hold the queue until its requests finish rather than
@@ -440,5 +608,37 @@ public final class MapleReplay {
                 _ = done.wait(timeout: .now() + Self.backgroundFlushTimeout + 1)
             }
         }
+    }
+
+    /// Wait for crash recovery to finish. Test seam.
+    func drainRecovery() {
+        recoveryQueue.sync {}
+    }
+
+    /// Return to the never-started state. Test seam: the singleton is process-global.
+    @MainActor
+    func resetForTesting() {
+        removeLifecycleObservers()
+        let retiring = locked { () -> ReplayRecorder? in
+            let retiring = recorder
+            configuration = nil
+            lastConfiguration = nil
+            session = nil
+            recorder = nil
+            onSegmentHandler = nil
+            didRecover = false
+            urlSessionOverride = nil
+            randomSource = { Double.random(in: 0..<1) }
+            return retiring
+        }
+        retiring?.stop()
+        SessionSink.shared.publish(sessionId: nil)
+        SessionSink.shared.setEventRelay(nil)
+    }
+
+    @discardableResult
+    private func locked<T>(_ body: () throws -> T) rethrows -> T {
+        lock.lock(); defer { lock.unlock() }
+        return try body()
     }
 }
