@@ -51,7 +51,13 @@ final class ReplayRecorder {
     /// Segments produced so far, for inspection. Only the records: the bodies are handed
     /// to `onSegment` and released, so a long session does not accumulate every chunk it
     /// ever uploaded in memory.
-    private(set) var artifacts: [SegmentArtifacts] = []
+    var artifacts: [SegmentArtifacts] {
+        artifactsLock.lock(); defer { artifactsLock.unlock() }
+        return artifactRecords
+    }
+    /// Read from any thread through `MapleReplay.segments`, appended on `workQueue`.
+    private var artifactRecords: [SegmentArtifacts] = []
+    private let artifactsLock = NSLock()
 
     /// Called on `workQueue` as each segment is prepared, with the bytes to upload.
     var onSegment: ((PreparedSegment) -> Void)?
@@ -206,7 +212,7 @@ final class ReplayRecorder {
         // The frame reaching the spool is the same value the buffer holds, already
         // redacted and compressed. There is no path by which an unredacted frame
         // reaches disk.
-        spool?.append(frame)
+        spool?.append(frame, nextChunkSeq: sequencer.peek)
 
         if case .buffered = capture, let oldest = buffer.frames.first?.timestamp {
             // Touches age out with the video they belong to.
@@ -292,12 +298,24 @@ final class ReplayRecorder {
                 let segment = try writer.prepare(
                     video: video, events: events, chunkSeq: seq, isCheckpoint: true
                 )
-                artifacts.append(segment.artifacts)
+                artifactsLock.lock()
+                artifactRecords.append(segment.artifacts)
+                artifactsLock.unlock()
                 onSegment?(segment)
             } catch {
                 NSLog("[MapleReplay] segment \(seq) failed: \(error)")
             }
         }
+    }
+
+    /// Record a user id change in the spool manifest, for the row crash recovery posts.
+    func updateUserId(_ userId: String) {
+        workQueue.async { [spool] in spool?.updateUserId(userId) }
+    }
+
+    /// Delete the spool of a recorder that never started.
+    func discardSpool() {
+        workQueue.async { [spool] in spool?.remove() }
     }
 
     /// Wait for everything queued so far. Test seam.

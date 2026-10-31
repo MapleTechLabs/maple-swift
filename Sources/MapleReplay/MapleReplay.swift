@@ -238,12 +238,16 @@ public final class MapleReplay: @unchecked Sendable {
     /// Posts a fresh `active` row so the id is searchable while the session is still
     /// live, and carries over to later sessions until changed. Pass `""` on sign-out.
     public func setUserId(_ userId: String) {
-        let changed: Bool = locked {
-            guard configuration != nil, configuration?.userId != userId else { return false }
+        let changed: (Bool, ReplayRecorder?) = locked {
+            guard configuration != nil, configuration?.userId != userId else { return (false, nil) }
             configuration?.userId = userId
-            return session?.pausedAt == nil && session != nil
+            return (true, recorder)
         }
-        if changed { postMeta(status: .active) }
+        guard changed.0 else { return }
+        // The spool too: a crash-recovered `ended` row outranks every row posted before
+        // it, and would otherwise put the old id back.
+        changed.1?.updateUserId(userId)
+        postMeta(status: .active)
     }
 
     /// Buffer a distilled event, whoever raised it.
@@ -310,37 +314,47 @@ public final class MapleReplay: @unchecked Sendable {
 
     @MainActor
     private func startCaptureRun(for session: Session) {
-        let recorder: ReplayRecorder? = locked {
-            guard let configuration, session.mode != .off, self.session === session, self.recorder == nil else {
-                return nil
-            }
-            let options = configuration.options
-            let recorder = ReplayRecorder(
-                sessionId: session.id,
-                options: options,
-                capture: session.mode == .buffer
-                    ? .buffered(window: options.errorBufferWindow)
-                    : .continuous(segmentDuration: options.segmentDuration),
-                sequencer: session.sequencer,
-                run: session.run,
-                mode: session.mode,
-                startedAt: session.startedAt,
-                serviceName: configuration.serviceName,
-                environment: configuration.environment,
-                userId: configuration.userId
-            )
-            let transport = session.transport
-            // Runs on the recorder's work queue. Upload starts here, from that queue:
-            // there is no reason to bounce a finished chunk through the main thread first.
-            recorder.onSegment = { [weak self] segment in
-                transport.postBlob(segment)
-                self?.flushEvents(of: session)
-                DispatchQueue.main.async { self?.onSegment?(segment.artifacts) }
-            }
-            self.recorder = recorder
-            return recorder
+        let snapshot: Configuration? = locked {
+            guard let configuration, session.mode != .off, self.session === session, recorder == nil else { return nil }
+            return configuration
         }
-        recorder?.start()
+        guard let configuration = snapshot else { return }
+        let options = configuration.options
+        // Built outside the lock: creating the spool touches the disk, and every event
+        // raised on another thread waits on this lock.
+        let recorder = ReplayRecorder(
+            sessionId: session.id,
+            options: options,
+            capture: session.mode == .buffer
+                ? .buffered(window: options.errorBufferWindow)
+                : .continuous(segmentDuration: options.segmentDuration),
+            sequencer: session.sequencer,
+            run: session.run,
+            mode: session.mode,
+            startedAt: session.startedAt,
+            serviceName: configuration.serviceName,
+            environment: configuration.environment,
+            userId: configuration.userId
+        )
+        let transport = session.transport
+        // Runs on the recorder's work queue. Upload starts here, from that queue: there is
+        // no reason to bounce a finished chunk through the main thread first.
+        recorder.onSegment = { [weak self] segment in
+            transport.postBlob(segment)
+            self?.flushEvents(of: session)
+            DispatchQueue.main.async { self?.onSegment?(segment.artifacts) }
+        }
+        let installed: Bool = locked {
+            guard self.configuration != nil, self.session === session, session.pausedAt == nil,
+                  self.recorder == nil else { return false }
+            self.recorder = recorder
+            return true
+        }
+        if installed {
+            recorder.start()
+        } else {
+            recorder.discardSpool()
+        }
     }
 
     /// Flush the tail, post the `ended` row, and stop capturing. The session itself is
@@ -437,8 +451,14 @@ public final class MapleReplay: @unchecked Sendable {
     /// The row is the **billed** unit and the only thing that makes a session appear in
     /// the UI; blobs are not metered. An SDK that uploads chunks and never posts one
     /// bills nothing and records into a void.
+    /// Checked and versioned under one lock: a caller that saw a live session and then
+    /// posted after a pause began would otherwise version an `active` row above the
+    /// `ended` one and reopen the session for good.
     private func postMeta(status: SessionMetaRow.Status) {
-        locked { session.flatMap { meta(status: status, session: $0) } }?.send()
+        locked { () -> MetaPost? in
+            guard let session, session.pausedAt == nil, configuration != nil else { return nil }
+            return meta(status: status, session: session)
+        }?.send()
     }
 
     /// Build the next row for `session`, taking its version. Caller holds `lock`.

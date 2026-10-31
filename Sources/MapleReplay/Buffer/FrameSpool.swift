@@ -15,7 +15,7 @@ struct SpoolManifest: Codable {
     let quality: String
     let serviceName: String
     let environment: String?
-    let userId: String
+    var userId: String
 
     /// Sequence number the crashed session would have used for its next segment.
     var nextChunkSeq: Int
@@ -124,8 +124,15 @@ final class FrameSpool {
     // MARK: - Capture
 
     /// Persist one redacted frame and evict anything now outside the window.
-    func append(_ frame: CapturedFrame) {
+    /// `nextChunkSeq` is the session's counter now. Another capture run of the same
+    /// session can take numbers after this spool was created (a retiring run encoding its
+    /// tail), so the manifest follows it, or a recovered segment could reuse one.
+    func append(_ frame: CapturedFrame, nextChunkSeq: Int? = nil) {
         guard isEnabled else { return }
+        if let nextChunkSeq, nextChunkSeq != manifest.nextChunkSeq {
+            manifest.nextChunkSeq = nextChunkSeq
+            try? writeManifest()
+        }
 
         let sequence = nextSequence
         nextSequence += 1
@@ -178,6 +185,12 @@ final class FrameSpool {
         entries.removeAll(keepingCapacity: true)
         spooledBytes = 0
         manifest.nextChunkSeq = nextChunkSeq
+        try? writeManifest()
+    }
+
+    func updateUserId(_ userId: String) {
+        guard isEnabled, manifest.userId != userId else { return }
+        manifest.userId = userId
         try? writeManifest()
     }
 
