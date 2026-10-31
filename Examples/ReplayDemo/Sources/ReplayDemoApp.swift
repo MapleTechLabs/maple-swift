@@ -3,33 +3,46 @@ import SwiftUI
 
 @main
 struct ReplayDemoApp: App {
+    @UIApplicationDelegateAdaptor(DemoAppDelegate.self) private var appDelegate
     @StateObject private var controller = RecorderController()
+
+    init() {
+        E2EConfiguration.startIfEnabled()
+    }
 
     var body: some Scene {
         WindowGroup {
-            ZStack(alignment: .bottom) {
-                TabView {
-                    OrdersScreen()
-                        .mapleScreen("Orders")
-                        .tabItem { Label("Orders", systemImage: "shippingbox") }
-                    NetworkScreen()
-                        .tabItem { Label("Network", systemImage: "network") }
-                    SwiftUIScreen()
-                        .mapleScreen("SwiftUIShowcase")
-                        .tabItem { Label("SwiftUI", systemImage: "swift") }
-                    UIKitScreen()
-                        .mapleScreen("UIKitShowcase")
-                        .tabItem { Label("UIKit", systemImage: "square.stack") }
-                }
-
-                DebugBar(controller: controller)
+            if E2EConfiguration.isEnabled {
+                E2EScreen()
+            } else {
+                demo
             }
-            .overlay {
-                if controller.showMaskPreview {
-                    MaskPreviewOverlay(options: controller.options)
-                        .allowsHitTesting(false)
-                        .ignoresSafeArea()
-                }
+        }
+    }
+
+    private var demo: some View {
+        ZStack(alignment: .bottom) {
+            TabView {
+                OrdersScreen()
+                    .mapleScreen("Orders")
+                    .tabItem { Label("Orders", systemImage: "shippingbox") }
+                NetworkScreen()
+                    .tabItem { Label("Network", systemImage: "network") }
+                SwiftUIScreen()
+                    .mapleScreen("SwiftUIShowcase")
+                    .tabItem { Label("SwiftUI", systemImage: "swift") }
+                UIKitScreen()
+                    .mapleScreen("UIKitShowcase")
+                    .tabItem { Label("UIKit", systemImage: "square.stack") }
+            }
+
+            DebugBar(controller: controller)
+        }
+        .overlay {
+            if controller.showMaskPreview {
+                MaskPreviewOverlay(options: controller.options)
+                    .allowsHitTesting(false)
+                    .ignoresSafeArea()
             }
         }
     }

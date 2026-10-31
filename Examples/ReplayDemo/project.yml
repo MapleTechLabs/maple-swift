@@ -31,7 +31,15 @@ targets:
       properties:
         UILaunchScreen: {}
         UIApplicationSupportsIndirectInputEvents: true
-        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
+        # Landscape is listed so the e2e rotation scenario can use it; `DemoAppDelegate`
+        # narrows every other launch back to portrait.
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        # The UI tests point the SDK at a plain-HTTP mock ingest on 127.0.0.1.
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
         Maple:
           IngestKey: $(MAPLE_INGEST_KEY)
           Endpoint: $(MAPLE_ENDPOINT)
@@ -47,3 +55,34 @@ targets:
         SWIFT_VERSION: "5.0"
         CODE_SIGNING_REQUIRED: NO
         CODE_SIGN_IDENTITY: ""
+
+  # End-to-end suite: drives the app on a simulator against a mock ingest server that
+  # runs inside the test runner. `scripts/e2e.sh` is the entry point.
+  ReplayDemoUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - path: UITests
+    dependencies:
+      - target: ReplayDemo
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.maple.ReplayDemoUITests
+        GENERATE_INFOPLIST_FILE: YES
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SWIFT_VERSION: "5.0"
+        CODE_SIGNING_REQUIRED: NO
+        CODE_SIGN_IDENTITY: ""
+
+schemes:
+  ReplayDemo:
+    build:
+      targets:
+        ReplayDemo: all
+        ReplayDemoUITests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - ReplayDemoUITests
