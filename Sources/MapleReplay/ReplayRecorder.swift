@@ -39,7 +39,6 @@ final class ReplayRecorder {
     private var timer: DispatchSourceTimer?
 
     private let sequencer: ChunkSequencer
-    private var segmentStart: Date?
     /// Main thread only.
     private var isRunning = false
     /// `workQueue` only. Set while a capture is queued on or running on the main thread.
@@ -128,7 +127,6 @@ final class ReplayRecorder {
     func start() {
         guard !isRunning else { return }
         isRunning = true
-        workQueue.async { [weak self] in self?.segmentStart = Date() }
 
         if let window = ViewCapture.activeWindow() {
             touchObserver.attach(to: window)
@@ -195,21 +193,24 @@ final class ReplayRecorder {
     }
 
     func ingest(_ frame: CapturedFrame) {
+        // A frame past the boundary closes the segment before it and opens the next, so
+        // the closing segment ends exactly where this frame begins: no seam replays
+        // twice and none freezes.
+        if case .continuous(let segmentDuration) = capture,
+           let start = buffer.frames.first?.timestamp,
+           frame.timestamp.timeIntervalSince(start) >= segmentDuration {
+            emitSegment(reason: "interval", endingAt: frame.timestamp)
+        }
+
         buffer.append(frame)
         // The frame reaching the spool is the same value the buffer holds, already
         // redacted and compressed. There is no path by which an unredacted frame
         // reaches disk.
         spool?.append(frame)
 
-        switch capture {
-        case .continuous(let segmentDuration):
-            let start = segmentStart ?? frame.timestamp
-            if frame.timestamp.timeIntervalSince(start) >= segmentDuration {
-                emitSegment(reason: "interval")
-            }
-        case .buffered:
+        if case .buffered = capture, let oldest = buffer.frames.first?.timestamp {
             // Touches age out with the video they belong to.
-            if let oldest = buffer.frames.first?.timestamp { touches.discard(olderThan: oldest) }
+            touches.discard(olderThan: oldest)
         }
     }
 
@@ -243,10 +244,10 @@ final class ReplayRecorder {
         }
     }
 
-    /// Must run on `workQueue`.
-    private func emitSegment(reason: String) {
+    /// Must run on `workQueue`. `end` is the capture time of the frame that follows, when
+    /// there is one.
+    private func emitSegment(reason: String, endingAt end: Date? = nil) {
         let frames = buffer.drain()
-        segmentStart = Date()
         guard let first = frames.first, let last = frames.last else { return }
 
         let runs = frames.runsOfEqualSize()
@@ -261,7 +262,7 @@ final class ReplayRecorder {
 
         // Up to the end of the last frame's display, so a tap during the final second
         // belongs to this segment rather than falling before the next one's start.
-        let videoEnd = last.timestamp.addingTimeInterval(1 / Double(options.frameRate))
+        let videoEnd = end ?? last.timestamp.addingTimeInterval(1 / Double(options.frameRate))
         let touchSamples = touches.drain(until: videoEnd, notBefore: first.timestamp)
 
         for (index, run) in runs.enumerated() {
@@ -270,7 +271,10 @@ final class ReplayRecorder {
             do {
                 let temporaryURL = FileManager.default.temporaryDirectory
                     .appendingPathComponent("maple-segment-\(seq)-\(UUID().uuidString).mp4")
-                let video = try VideoEncoder.encode(frames: run, options: options, to: temporaryURL)
+                // Only the last run knows its end: earlier runs end where the next size
+                // starts, which is that run's first frame.
+                let runEnd = index + 1 < runs.count ? runs[index + 1].first?.timestamp : end
+                let video = try VideoEncoder.encode(frames: run, options: options, to: temporaryURL, endingAt: runEnd)
 
                 let events = SegmentEvents.build(
                     sessionId: sessionId,

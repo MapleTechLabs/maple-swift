@@ -136,7 +136,7 @@ final class TouchObserver: NSObject, UIGestureRecognizerDelegate {
         if maskedRegions.contains(where: { $0.contains(point) }) { return true }
         var view = touchedView
         while let current = view {
-            if current is UITextInput || current.mapleReplayMaskOverride == true { return true }
+            if current is UIKeyInput || current.mapleReplayMaskOverride == true { return true }
             view = current.superview
         }
         return false

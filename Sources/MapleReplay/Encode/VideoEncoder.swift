@@ -33,21 +33,30 @@ enum VideoEncoder {
     /// waits behind, so a stuck writer must cost one segment, never the session.
     static let stepTimeout: TimeInterval = 10
 
+    /// Smallest frame side the encoder produces a playable file for. No real window is
+    /// near it; it guards frames built from hostile or degenerate geometry.
+    static let minimumDimension = 16
+
+    /// `endingAt` is when the last frame stops showing, when the caller knows it: the
+    /// capture time of the frame that starts the next segment, so the two meet exactly.
+    /// Otherwise the last frame is held one nominal frame interval.
     static func encode(
         frames: [CapturedFrame],
         options: ReplayOptions,
-        to url: URL
+        to url: URL,
+        endingAt end: Date? = nil
     ) throws -> EncodedVideo {
         guard let first = frames.first else { throw VideoEncoderError.noFrames }
 
         let size = first.size
         let width = Int(size.width)
         let height = Int(size.height)
-        guard width >= 2, height >= 2 else {
+        // Below this H.264 writes a file with no decodable samples and reports success.
+        guard width >= minimumDimension, height >= minimumDimension else {
             throw VideoEncoderError.writerSetupFailed("frame size \(width)x\(height) is too small to encode")
         }
         let frameRate = min(10, max(1, options.frameRate))
-        let times = presentationTimes(for: frames.map(\.timestamp), frameRate: frameRate)
+        let times = presentationTimes(for: frames.map(\.timestamp), frameRate: frameRate, endingAt: end)
 
         try? FileManager.default.removeItem(at: url)
 
@@ -75,6 +84,9 @@ enum VideoEncoder {
             ]
         )
         input.expectsMediaDataInRealTime = false
+        // The default 1/600 s timescale rounds millisecond timestamps, pushing frames
+        // captured close together off their capture times.
+        input.mediaTimeScale = 1000
 
         let adaptor = AVAssetWriterInputPixelBufferAdaptor(
             assetWriterInput: input,
@@ -89,6 +101,7 @@ enum VideoEncoder {
             throw VideoEncoderError.writerSetupFailed("writer rejected the video input")
         }
         writer.add(input)
+        writer.movieTimeScale = 1000
 
         guard writer.startWriting() else {
             throw VideoEncoderError.writerSetupFailed(
@@ -177,7 +190,8 @@ enum VideoEncoder {
     /// one non-increasing sample.
     static func presentationTimes(
         for timestamps: [Date],
-        frameRate: Int
+        frameRate: Int,
+        endingAt end: Date? = nil
     ) -> (frames: [CMTime], end: CMTime) {
         let frameMs = Int64(1000 / max(1, frameRate))
         guard let origin = timestamps.first else {
@@ -194,7 +208,17 @@ enum VideoEncoder {
             previous = value
         }
         let frames = values.map { CMTime(value: $0, timescale: 1000) }
-        return (frames, CMTime(value: previous + frameMs, timescale: 1000))
+        var endValue = previous + frameMs
+        if let end {
+            let elapsed = end.timeIntervalSince(origin) * 1000
+            if elapsed.isFinite {
+                // At least one millisecond of display, at most the nominal hold plus a
+                // second: a boundary far in the future means a stalled capture, not a frame
+                // that was on screen that long.
+                endValue = max(previous + 1, min(Int64(elapsed.rounded()), previous + frameMs + 1000))
+            }
+        }
+        return (frames, CMTime(value: endValue, timescale: 1000))
     }
 
     private static func pixelBuffer(

@@ -167,7 +167,7 @@ enum CrashRecovery {
         // Record the attempt *before* doing the work. If encoding is what kills the
         // process, the incremented count is already durable, and the next launch counts
         // one closer to giving up instead of repeating the same crash.
-        session.manifest.recoveryAttempts += 1
+        session.manifest.recoveryAttempts = max(0, min(session.manifest.recoveryAttempts, maxRecoveryAttempts)) + 1
         if session.manifest.recoveryAttempts > maxRecoveryAttempts {
             NSLog("[MapleReplay] discarding spool \(session.manifest.sessionId): recovery kept failing")
             try? FileManager.default.removeItem(at: session.directory)
@@ -197,9 +197,11 @@ enum CrashRecovery {
         )
 
         let runs = frames.runsOfEqualSize()
+        // The manifest is read off disk, so every number in it is untrusted.
+        let firstSeq = min(max(0, manifest.nextChunkSeq), Int(UInt32.max) - runs.count)
         var segments: [PreparedSegment] = []
         for (index, run) in runs.enumerated() {
-            let seq = manifest.nextChunkSeq + index
+            let seq = firstSeq + index
             guard let start = run.first?.timestamp else { continue }
             let isLast = index == runs.count - 1
             do {
@@ -243,9 +245,10 @@ enum CrashRecovery {
 
         // Close out the session row too. A session that never ends stays open forever,
         // and the last spooled frame is the best end time available.
+        let startedAt = manifest.startDate <= (frames.first?.timestamp ?? end) ? manifest.startDate : (frames.first?.timestamp ?? end)
         let endedRow = SessionMetaRow(
             sessionId: manifest.sessionId,
-            startedAt: manifest.startDate,
+            startedAt: SessionMetaRow.clampedToColumnRange(startedAt),
             status: .ended,
             version: recoveredRowVersion(),
             serviceName: manifest.serviceName,
