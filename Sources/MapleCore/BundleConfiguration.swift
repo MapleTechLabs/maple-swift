@@ -56,10 +56,10 @@ public struct MapleBundleConfiguration: Sendable {
 
         // Tolerates both `<real>` and `<string>`: a build setting substituted into a
         // plist is always a string, and hand-written plists tend to use a number.
-        if let number = values["TracesSampleRate"] as? NSNumber {
+        if let number = values["TracesSampleRate"] as? NSNumber, number.doubleValue.isFinite {
             configuration.tracesSampleRate = number.doubleValue
         } else if let raw = string(values["TracesSampleRate"], key: "TracesSampleRate") {
-            if let value = Double(raw) {
+            if let value = Double(raw), value.isFinite {
                 configuration.tracesSampleRate = value
             } else {
                 MapleLog.notice("Maple", "Info.plist Maple.TracesSampleRate is not a number (\(raw)); ignoring")

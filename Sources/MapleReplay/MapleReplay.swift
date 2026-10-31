@@ -188,8 +188,13 @@ public final class MapleReplay: @unchecked Sendable {
             return session
         }
         guard let retired else { return }
-        pauseSession(reason: "stop") { [weak self] in
-            self?.discard(retired)
+        pauseSession(reason: "stop") {
+            SessionSink.shared.discard(sessionId: retired.id)
+        }
+        // Detached now rather than when the teardown's uploads finish, so a `start()`
+        // straight after this begins a new session instead of finding the old one.
+        locked {
+            if session === retired { session = nil }
         }
     }
 
@@ -346,22 +351,26 @@ public final class MapleReplay: @unchecked Sendable {
     /// background task open for exactly as long as it needs.
     @MainActor
     private func pauseSession(reason: String, completion: (() -> Void)? = nil) {
-        let state: (Session, ReplayRecorder?, [SessionEventRow])? = locked {
+        let pausedAt = Date()
+        let state: (Session, ReplayRecorder?, [SessionEventRow], MetaPost?)? = locked {
             guard let session, session.pausedAt == nil else { return nil }
-            session.pausedAt = Date()
+            session.pausedAt = pausedAt
             let retiring = recorder
             recorder = nil
-            return (session, retiring, takeEvents(session))
+            // Built, and its version taken, now rather than after the tail is encoded.
+            // A quick return to the foreground posts the resume's `active` row in the
+            // meantime, and an `ended` row versioned after it would close a live session.
+            return (session, retiring, takeEvents(session), meta(status: .ended, session: session))
         }
-        guard let (session, retiring, trailingEvents) = state else { completion?(); return }
+        guard let (session, retiring, trailingEvents, endedRow) = state else { completion?(); return }
 
         SessionSink.shared.publish(sessionId: nil)
         SessionSink.shared.setEventRelay(nil)
         let transport = session.transport
 
-        let finish: () -> Void = { [weak self] in
+        let finish: () -> Void = {
             if !trailingEvents.isEmpty { transport.postEvents(trailingEvents) }
-            self?.postMeta(status: .ended, for: session)
+            endedRow?.send(now: pausedAt)
             transport.awaitPending(timeout: Self.backgroundFlushTimeout) {
                 DispatchQueue.main.async { completion?() }
             }
@@ -408,43 +417,37 @@ public final class MapleReplay: @unchecked Sendable {
         }
     }
 
-    private func discard(_ retired: Session) {
-        locked {
-            if session === retired { session = nil }
-        }
-        SessionSink.shared.discard(sessionId: retired.id)
-    }
-
     // MARK: - Metadata
 
-    /// Post a metadata row for the live session, or for `target` when it is given.
+    /// A metadata row and where it goes.
+    private struct MetaPost {
+        let row: SessionMetaRow
+        let transport: ReplayTransport
+        /// `meta.ndjson` mirror, when disk output is on.
+        let directory: URL?
+
+        func send(now: Date = Date()) {
+            transport.postMeta(row, now: now)
+            if let directory { row.append(to: directory, now: now) }
+        }
+    }
+
+    /// Post a metadata row for the live session.
     ///
     /// The row is the **billed** unit and the only thing that makes a session appear in
     /// the UI; blobs are not metered. An SDK that uploads chunks and never posts one
     /// bills nothing and records into a void.
-    private func postMeta(status: SessionMetaRow.Status, for target: Session? = nil) {
-        let built: (SessionMetaRow, ReplayTransport, URL?)? = locked {
-            guard let session = target ?? session, let configuration else {
-                // After `stop()` the configuration is gone but the closing row is still
-                // owed, so fall back to what the row was last built from.
-                guard let target, let last = lastConfiguration else { return nil }
-                return build(status: status, session: target, configuration: last)
-            }
-            lastConfiguration = configuration
-            return build(status: status, session: session, configuration: configuration)
-        }
-        guard let (row, transport, directory) = built else { return }
-        let now = Date()
-        transport.postMeta(row, now: now)
-        if let directory { row.append(to: directory, now: now) }
+    private func postMeta(status: SessionMetaRow.Status) {
+        locked { session.flatMap { meta(status: status, session: $0) } }?.send()
     }
 
-    /// Caller holds `lock`.
-    private func build(
-        status: SessionMetaRow.Status,
-        session: Session,
-        configuration: Configuration
-    ) -> (SessionMetaRow, ReplayTransport, URL?) {
+    /// Build the next row for `session`, taking its version. Caller holds `lock`.
+    ///
+    /// After `stop()` the configuration is gone but the closing row is still owed, so it
+    /// falls back to what the last row was built from.
+    private func meta(status: SessionMetaRow.Status, session: Session) -> MetaPost? {
+        guard let configuration = configuration ?? lastConfiguration else { return nil }
+        lastConfiguration = configuration
         let counters = SessionSink.shared.counters(for: session.id)
         let row = SessionMetaRow(
             sessionId: session.id,
@@ -465,7 +468,7 @@ public final class MapleReplay: @unchecked Sendable {
             ? ReplayRecorder.rootDirectory(options: configuration.options)
                 .appendingPathComponent(session.id, isDirectory: true)
             : nil
-        return (row, session.transport, directory)
+        return MetaPost(row: row, transport: session.transport, directory: directory)
     }
 
     private var lastConfiguration: Configuration?

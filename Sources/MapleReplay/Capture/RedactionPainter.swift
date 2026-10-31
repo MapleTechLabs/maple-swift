@@ -20,7 +20,11 @@ enum RedactionPainter {
         )
         // Points-to-output-pixels. Derived from the rounded target rather than from the
         // requested scale, so the evening-off below can't shift the masks off their glyphs.
-        let scale = targetSize.width / max(source.size.width, 1)
+        // Per axis: each dimension is evened separately, so one factor for both puts
+        // masks near the far edge a few pixels off their content.
+        let scaleX = targetSize.width / max(source.size.width, 1)
+        let scaleY = targetSize.height / max(source.size.height, 1)
+        let scale = min(scaleX, scaleY)
 
         let format = UIGraphicsImageRendererFormat()
         format.scale = 1
@@ -44,8 +48,13 @@ enum RedactionPainter {
             // half the slack `low` gets. The floor keeps at least two *pixels* as well,
             // which is what the sub-pixel offset needs at tiers below 1x.
             let padding = max(Self.redactionPadding, Self.redactionPadding * scale)
-            for rect in pending.redactions where !rect.isNull && !rect.isInfinite {
-                let scaled = rect.applying(CGAffineTransform(scaleX: scale, y: scale))
+            let sourceBounds = CGRect(origin: .zero, size: source.size)
+            for redaction in pending.redactions where Self.isFinite(redaction) {
+                // Trimmed to the frame before scaling: a huge but finite rect overflows to
+                // infinity when scaled, and an infinite rect fills nothing.
+                let rect = redaction.standardized.intersection(sourceBounds.insetBy(dx: -1, dy: -1))
+                guard !rect.isNull, !rect.isEmpty else { continue }
+                let scaled = rect.applying(CGAffineTransform(scaleX: scaleX, y: scaleY))
                 context.fill(scaled.insetBy(dx: -padding, dy: -padding).integral)
             }
         }
@@ -56,6 +65,13 @@ enum RedactionPainter {
         return CapturedFrame(
             jpeg: jpeg, timestamp: pending.timestamp, size: targetSize, pointSize: source.size
         )
+    }
+
+    /// Every component a real number. The scanner only emits rects clipped to the
+    /// window, so anything else is broken geometry with no region to mask.
+    static func isFinite(_ rect: CGRect) -> Bool {
+        !rect.isNull && !rect.isInfinite && rect.origin.x.isFinite && rect.origin.y.isFinite
+            && rect.size.width.isFinite && rect.size.height.isFinite
     }
 
     /// Output size in pixels for a window of `size` points at `scale` pixels per point.

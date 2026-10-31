@@ -124,7 +124,11 @@ private func randomHex(bytes count: Int) -> String {
 private let hexDigits = Array("0123456789abcdef")
 
 private extension Character {
+    /// One ASCII scalar in `0-9a-f`. Comparing `Character`s with a range is not enough:
+    /// `"6\u{301}"` sorts between "0" and "9", and would carry a combining mark into a
+    /// header that must be ASCII.
     var isLowercaseHexDigit: Bool {
-        ("0"..."9").contains(self) || ("a"..."f").contains(self)
+        guard unicodeScalars.count == 1, let scalar = unicodeScalars.first else { return false }
+        return ("0"..."9").contains(scalar) || ("a"..."f").contains(scalar)
     }
 }

@@ -110,6 +110,8 @@ public final class Tracer: @unchecked Sendable {
     /// sampler: compare the leading 8 bytes against the threshold.
     private func shouldSample(traceId: TraceID) -> Bool {
         let rate = options.tracesSampleRate
+        // NaN compares false both ways and would reach `UInt64(NaN)`, which traps.
+        guard rate.isFinite else { return rate == .infinity }
         if rate >= 1 { return true }
         if rate <= 0 { return false }
         let prefix = String(traceId.hex.prefix(16))

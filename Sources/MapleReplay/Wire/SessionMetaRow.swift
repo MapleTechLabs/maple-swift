@@ -149,7 +149,7 @@ public struct SessionMetaRow {
 
         if status == .ended {
             row["end_time"] = Self.clickHouseDateTime(now)
-            row["duration_ms"] = max(0, Int(now.timeIntervalSince(startedAt) * 1000))
+            row["duration_ms"] = Self.durationMilliseconds(from: startedAt, to: now)
             row["trace_ids"] = traceIds
         }
         return row
@@ -188,7 +188,22 @@ public struct SessionMetaRow {
 
     /// ClickHouse `DateTime64(3)` literal: `YYYY-MM-DD HH:MM:SS.mmm`, always UTC.
     static func clickHouseDateTime(_ date: Date) -> String {
-        dateTimeFormatter.string(from: date)
+        dateTimeFormatter.string(from: clampedToColumnRange(date))
+    }
+
+    /// `DateTime64` holds 1900 through 2299. A date outside it (a corrupt spool, a clock
+    /// set absurdly) would otherwise format as a five-digit year the gateway rejects.
+    static func clampedToColumnRange(_ date: Date) -> Date {
+        let seconds = date.timeIntervalSince1970
+        guard seconds.isFinite else { return Date(timeIntervalSince1970: 0) }
+        return Date(timeIntervalSince1970: min(10_413_791_999, max(-2_208_988_800, seconds)))
+    }
+
+    /// Non-negative and representable, whatever the two dates are.
+    static func durationMilliseconds(from start: Date, to end: Date) -> Int {
+        let milliseconds = end.timeIntervalSince(start) * 1000
+        guard milliseconds.isFinite, milliseconds > 0 else { return 0 }
+        return Int(min(milliseconds, Double(Int32.max) * 1000))
     }
 
     /// Built once: a `DateFormatter` costs more to make than to use, and this runs for

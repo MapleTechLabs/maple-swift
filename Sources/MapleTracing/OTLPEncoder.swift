@@ -68,10 +68,11 @@ enum OTLPEncoder {
     }
 
     static func encode(spans: [SpanData], resource: [String: AttributeValue]) throws -> Data {
-        try JSONSerialization.data(
-            withJSONObject: payload(spans: spans, resource: resource),
-            options: [.sortedKeys]
-        )
+        let object = payload(spans: spans, resource: resource)
+        // `JSONSerialization` raises an Objective-C exception on invalid input, which
+        // would take the host app down from inside a telemetry export.
+        guard JSONSerialization.isValidJSONObject(object) else { throw OTLPEncoderError.invalidJSON }
+        return try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
     }
 
     private static func span(_ data: SpanData) -> [String: Any] {
@@ -133,7 +134,11 @@ enum OTLPEncoder {
     /// the multiply would round a second time, on top of the rounding `Date` already did.
     /// The integer seconds go through exactly and only the small fraction is scaled.
     static func nanoseconds(_ date: Date) -> String {
-        let interval = date.timeIntervalSince1970
+        // Clamped to what a UInt64 of nanoseconds holds (1970 to 2554): `UInt64` traps on
+        // a negative and the multiply wraps past the top. Dates come from host code and
+        // crash payloads.
+        let raw = date.timeIntervalSince1970
+        let interval = raw.isFinite ? min(max(0, raw), 18_446_744_072) : 0
         let seconds = interval.rounded(.down)
         let fraction = interval - seconds
         let nanos = UInt64(seconds) &* 1_000_000_000 &+ UInt64((fraction * 1_000_000_000).rounded())
@@ -141,6 +146,10 @@ enum OTLPEncoder {
     }
 }
 
+enum OTLPEncoderError: Error {
+    case invalidJSON
+}
+
 enum MapleTracingVersion {
-    static let current = "0.3.2"
+    static let current = "0.4.0"
 }

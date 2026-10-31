@@ -141,5 +141,10 @@ struct RRWebEvent {
 }
 
 extension Date {
-    var epochMilliseconds: Int { Int((timeIntervalSince1970 * 1000).rounded()) }
+    /// Clamped to years 0 through 9999 so a hostile or corrupt date cannot overflow `Int`.
+    var epochMilliseconds: Int {
+        let milliseconds = timeIntervalSince1970 * 1000
+        guard milliseconds.isFinite else { return 0 }
+        return Int(min(253_402_300_799_000, max(-62_135_596_800_000, milliseconds)).rounded())
+    }
 }

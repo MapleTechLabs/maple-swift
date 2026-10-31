@@ -233,7 +233,9 @@ struct SpooledSession {
     static func read(directory: URL) -> SpooledSession? {
         let manifestURL = directory.appendingPathComponent(FrameSpool.manifestName)
         guard let data = try? Data(contentsOf: manifestURL),
-              let manifest = try? JSONDecoder().decode(SpoolManifest.self, from: data) else {
+              let manifest = try? JSONDecoder().decode(SpoolManifest.self, from: data),
+              // The gateway rejects any other id, so such a spool has nothing to upload.
+              SegmentWriter.isSafeSessionId(manifest.sessionId) else {
             return nil
         }
 

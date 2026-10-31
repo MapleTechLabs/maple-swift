@@ -17,7 +17,12 @@ public enum AttributeValue: Equatable, Sendable {
         switch self {
         case .string(let value): return ["stringValue": value]
         case .int(let value): return ["intValue": String(value)]  // 64-bit ints are strings in OTLP/JSON
-        case .double(let value): return ["doubleValue": value]
+        // Non-finite doubles use the proto3 JSON spellings. A raw NaN would reach
+        // `JSONSerialization`, which raises an exception Swift cannot catch.
+        case .double(let value):
+            if value.isNaN { return ["doubleValue": "NaN"] }
+            if value.isInfinite { return ["doubleValue": value > 0 ? "Infinity" : "-Infinity"] }
+            return ["doubleValue": value]
         case .bool(let value): return ["boolValue": value]
         case .stringArray(let values):
             return ["arrayValue": ["values": values.map { ["stringValue": $0] }]]
