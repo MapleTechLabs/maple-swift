@@ -106,6 +106,8 @@ public final class MapleReplay: @unchecked Sendable {
     var urlSessionOverride: URLSession?
     /// Test seam for the sampling roll.
     var randomSource: () -> Double = { Double.random(in: 0..<1) }
+    /// Test seam: package tests have no `UIApplication` to hold a background task with.
+    var holdsBackgroundTask = true
 
     init() {}
 
@@ -524,6 +526,10 @@ public final class MapleReplay: @unchecked Sendable {
     @MainActor
     func handleDidEnterBackground() {
         guard locked({ session != nil && session?.pausedAt == nil }) else { return }
+        guard holdsBackgroundTask else {
+            pauseSession(reason: "background")
+            return
+        }
 
         let application = UIApplication.shared
         var identifier = UIBackgroundTaskIdentifier.invalid
@@ -628,6 +634,7 @@ public final class MapleReplay: @unchecked Sendable {
             onSegmentHandler = nil
             didRecover = false
             urlSessionOverride = nil
+            holdsBackgroundTask = true
             randomSource = { Double.random(in: 0..<1) }
             return retiring
         }
