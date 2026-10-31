@@ -10,11 +10,15 @@ resolves to the recording that produced it and back again — the same contract 
 import Maple
 
 var options = MapleOptions()
-options.ingestKey = "maple_pk_…"                     // required
-options.replay.flushPolicy = .buffered(window: 30)   // or .continuous(segmentDuration: 5)
+options.ingestKey = "maple_pk_…"            // required
+options.replay.sessionSampleRate = 0.1      // record 10% of sessions from the first frame
+options.replay.onErrorSampleRate = 1.0      // keep the last 30 s of the rest for errors
 Maple.start(options: options, serviceName: "my-app", environment: "production")
 
-// In buffered mode nothing is emitted until something asks for it:
+// After sign-in:
+Maple.setUserId("user-42")
+
+// In your error handler. An error-buffered session uploads its last 30 s and records from here on:
 Maple.flush(trigger: "error")
 ```
 
@@ -222,14 +226,46 @@ whether we stop:
 Failures warn at most once every 30 s, matching the browser SDK, so a misconfigured endpoint is
 visible in the log without flooding it.
 
-### Sessions end at the background transition
+### Backgrounding pauses the session
 
 There is no `keepalive` and no unload beacon on iOS, so backgrounding is the last moment anything
 can be sent. On `UIApplication.didEnterBackground` the SDK flushes the tail, posts the `ended` row,
-and holds a `UIApplication` background task open until those requests finish (8 s ceiling — the OS
-kills an app that overruns). Coming back to the foreground starts a **new** session with a new id:
-a session that has reported itself ended must not keep recording under the same id, and the
-per-session byte budget resets with it.
+and holds a `UIApplication` background task open until those requests finish (8 s ceiling, because
+the OS kills an app that overruns).
+
+Coming back within `backgroundSessionTimeout` (30 s by default) **resumes** the same session: a
+fresh `active` row with a higher `version` supersedes the `ended` one, chunk sequence numbers carry
+on, and the recording is one visit long rather than split at every trip to Messages for a 2FA code.
+Coming back later starts a new session with a new id. Set the timeout to 0 to rotate on every
+background.
+
+Every metadata row of a session takes the next `version` (the table keeps the highest), so the
+first `active` row is always version 1, which is the one ingest bills. The `ended` row a crash
+recovery posts on the next launch uses the epoch second as its version, so it outranks anything the
+crashed run managed to post.
+
+## Sampling
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `sessionSampleRate` | 1.0 | Fraction of sessions recorded from their first frame, uploaded every `segmentDuration` (5 s) |
+| `onErrorSampleRate` | 0.0 | Of the rest, the fraction that keep the last `errorBufferWindow` (30 s) in memory and on disk |
+| neither | | The session still exists, so spans and events stay joined to it, but nothing is captured |
+
+Rolled once per session, when it starts. A resumed session keeps its decision.
+
+An error-buffered session posts `maple.session.recorded = "false"` until `flush(trigger:)` (or a
+crash, through crash recovery) uploads its window. Then it posts a new `active` row with
+`recorded = "true"` and `maple.session.replay_trigger = "error"`, and records continuously for
+the rest of the session. Backgrounding is not an error: an error-buffered session that was never
+flushed drops its window when the app leaves.
+
+`flushPolicy` from 0.3 still compiles (deprecated) and maps onto these fields:
+`.continuous(segmentDuration:)` is `sessionSampleRate = 1`, `.buffered(window:)` is
+`sessionSampleRate = 0, onErrorSampleRate = 1`.
+
+Numeric options are clamped to ranges the recorder can run with (`frameRate` 1 to 10,
+`segmentDuration` 1 to 60 s, `errorBufferWindow` 1 to 120 s, rates 0 to 1, NaN treated as unset).
 
 ## Approach
 
@@ -257,8 +293,38 @@ That inverts the usual failure mode. When Apple renames a SwiftUI internal, a wi
 draws a blank box where your UI was. Here an unrecognised drawing surface is *masked* — degraded,
 never leaked.
 
-All masking defaults are on (`maskAllText`, `maskAllImages`). `unmaskedViewClasses` is the only
-opt-out.
+All masking defaults are on (`maskAllText`, `maskAllImages`).
+
+Some content is masked whatever the options and opt-outs say:
+
+- anything that accepts typed input (`UIKeyInput`, so a custom PIN pad that adopts only that
+  protocol counts), and secure text entry
+- a view marked `view.mapleReplayMask()`, or SwiftUI content inside `.mapleReplayMask()`
+
+Masking can be widened per class (`maskedViewClasses`, subclasses included) and narrowed per class
+(`unmaskedViewClasses`, exact type only) or per instance:
+
+```swift
+cardNumberView.mapleReplayMask()   // UIKit: always mask this view and its subviews
+priceLabel.mapleReplayUnmask()     // UIKit: show this one instance
+
+Text(order.total).mapleReplayUnmask()        // SwiftUI
+PinPad().mapleReplayMask()                   // SwiftUI: masked, and taps inside it are not recorded
+```
+
+An unmask turns off the automatic text and image rules for that view and everything inside it.
+Typed input, secure entry, explicit masks and masked classes inside it stay masked.
+
+Masks follow what is on screen during animations. The capture draws the committed frame, which
+mid-transition is the presentation tree, while the view tree already holds the end state, so a
+view that is moving, scaling or fading out is masked both where it is drawn and where it is going.
+A masked view that does not clip also masks its subviews where they hang outside it, and an image
+view that does not clip is masked where its image actually draws.
+
+**Touches.** Each touch is recorded with its position so playback can show what caused each
+change. A touch inside a forced mask (typed input, explicit masks) still counts as a click, but its
+position is never recorded: taps on a masked keypad would otherwise spell the PIN. Moves are
+throttled to 10 Hz. Set `recordTouches = false` to record none.
 
 Turn on `MaskingPreviewView` while developing: it runs the same scanner the recorder does and
 draws the rects live, so a wrong mask is visible immediately instead of after exporting a video.
@@ -276,8 +342,15 @@ segment is also mirrored to `<caches>/maple-replay/<session-id>/`, which is how 
 | `segment-NNN.mp4` | The same video, kept unreferenced so a human can double-click it |
 | `meta.ndjson` | The rows posted to `POST /v1/sessionReplays/meta` |
 
-Events per segment: an rrweb `meta` (type 4), a `custom` event (type 5) tagged `video` carrying the
-MP4 as base64, a segment breadcrumb, and touch events as `incrementalSnapshot` (type 3).
+Events per segment: an rrweb `meta` (type 4, always first: the player takes its timestamp as the
+segment's time zero), a `custom` event (type 5) tagged `video` carrying the MP4 as base64, a segment
+breadcrumb, and touch events as `incrementalSnapshot` (type 3) in the video's pixel coordinates.
+
+Frames are timed by their capture timestamps (`frameRateType: "variable"`), so a stretch where the
+main thread was too busy to capture plays back at the length it lasted instead of compressing and
+pulling every later touch off its frame. A segment closed by the interval rule ends exactly where
+the next one's first frame begins. A size change (rotation, an iPad window resize) starts a new
+segment rather than stretching frames into the old size.
 
 ## Crash recovery
 
@@ -412,7 +485,39 @@ the frame that change, and resolution mostly buys sharper still detail rather th
 
 ```bash
 xcodebuild test -scheme maple-swift-Package -destination 'platform=iOS Simulator,name=iPhone 17 Pro'
+scripts/e2e.sh   # end-to-end: the demo app against a mock ingest server, ~3 minutes
 ```
+
+### Fuzzing
+
+The `Fuzz*`, `Privacy*` and `Media*` test classes are seeded property tests. They run a small
+number of cases in the normal suite; for a soak, raise the count and pin or randomise the seed:
+
+```bash
+TEST_RUNNER_MAPLE_FUZZ_ITERATIONS=4000 TEST_RUNNER_MAPLE_FUZZ_SEED=random \
+  xcodebuild test -scheme maple-swift-Package -destination 'platform=iOS Simulator,name=iPhone 17 Pro'
+```
+
+Every failure prints its seed (and for the `Fuzz*` classes a per-case seed,
+`MAPLE_FUZZ_CASE_SEED`), so it reruns alone. The `TEST_RUNNER_` prefix is how `xcodebuild` passes an
+environment variable to the test process; it only works in front of the command.
+
+What they cover: the privacy contract on random UIKit and SwiftUI trees (rect coverage and, on
+rendered pixels, that no sensitive colour survives at any tier, including mid-animation), the
+painter and encoder on hostile geometry and timestamps, segment splitting, crash recovery on
+corrupt spool trees, the wire rows on hostile strings and dates, gzip against an independent
+inflater, the transport's kill switches, the session lifecycle as a random state machine, and the
+tracing parsers.
+
+### End to end
+
+`scripts/e2e.sh` regenerates the demo project and runs `ReplayDemoUITests`: the demo app records on
+a simulator and uploads to a mock ingest server inside the UI test runner, and every test asserts
+on the bytes received. It covers the cold-start wire contract (rows, headers, decodable MP4s,
+contiguous segments), masked pixels in the decoded video, touch coordinates and touch suppression
+over a masked keypad, background resume and expiry, error buffering, sampling off, crash recovery
+across a relaunch, the 413 and 402 kill switches, `setUserId` and `track`, and rotation. Pass a
+test method name to run one, and `DESTINATION=...` to pick a simulator.
 
 `swift build` does not work — the package is UIKit-only, and SwiftPM builds for macOS by default.
 Use an iOS Simulator destination. The scheme is `maple-swift-Package`, not `maple-swift`: the
@@ -456,7 +561,7 @@ watch the 200s.
 
 ## Not here yet
 
-Playback and Android.
+Android.
 
 Known gaps in tracing, all deliberate:
 
