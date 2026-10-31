@@ -80,6 +80,8 @@ final class ReplayRecorder {
         self.capture = capture ?? .continuous(segmentDuration: options.segmentDuration)
         self.sequencer = sequencer
         self.touchObserver = TouchObserver(tracker: touches, recordLocations: options.recordTouches)
+        let scanner = RedactionScanner(options: options)
+        touchObserver.isForcedView = { scanner.isForcedByRule($0) }
         let capacity = FrameRingBuffer.capacity(
             forSeconds: self.capture.retainedSeconds,
             frameRate: options.frameRate
