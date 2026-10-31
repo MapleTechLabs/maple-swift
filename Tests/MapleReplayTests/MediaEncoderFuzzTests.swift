@@ -47,8 +47,10 @@ final class MediaEncoderFuzzTests: XCTestCase {
                 let decoded = try MediaFuzzVideo.decode(video.url)
                                 XCTAssertEqual(decoded.pts.count, video.frameCount, "\(size): encode succeeded but the MP4 has \(decoded.pts.count) decodable samples")
                 assertColors(decoded.centers, plan: plan, context: "size \(size) case \(index)")
-            case .failure:
-                continue
+            case .failure(let error):
+                // Refusing is only allowed below the size H.264 can write a playable file for.
+                XCTAssertTrue(Int(size.width) < VideoEncoder.minimumDimension || Int(size.height) < VideoEncoder.minimumDimension,
+                              "\(size) must encode, but threw \(error)")
             }
         }
     }
@@ -64,9 +66,9 @@ final class MediaEncoderFuzzTests: XCTestCase {
             return XCTFail("encode threw")
         }
         let decoded = try MediaFuzzVideo.decode(video.url)
-        let expected = VideoEncoder.presentationTimes(for: timestamps, frameRate: 1).frames
-        XCTAssertEqual(decoded.pts.map { Int(($0.seconds * 1000).rounded()) },
-                       expected.map { Int(($0.seconds * 1000).rounded()) })
+        // Stated from the input, not from `presentationTimes`: duplicates step 1 ms apart,
+        // and the half-second gap is kept.
+        XCTAssertEqual(decoded.pts.map { Int(($0.seconds * 1000).rounded()) }, [0, 1, 2, 3, 4, 5, 500])
     }
 
     // MARK: - Oracle

@@ -137,8 +137,9 @@ struct RedactionScanner {
         case all
         /// Inside an explicit unmask: only the rules no opt-out reaches (typed input,
         /// explicit masks, masked classes). The automatic text and image heuristics are
-        /// what an unmask turns off.
-        case forcedOnly
+        /// what an unmask turns off, and only within the unmasked view's own frame: a
+        /// descendant drawn past it gets every rule again.
+        case forcedOnly(within: CGRect)
         /// Inside a masked view that does not clip: every visible descendant is masked,
         /// because UIKit draws it even where it hangs outside the parent's mask.
         case inherited(forced: Bool)
@@ -221,6 +222,12 @@ struct RedactionScanner {
             return
         }
 
+        var rules = rules
+        if case .forcedOnly(let region) = rules,
+           !region.insetBy(dx: -0.5, dy: -0.5).contains(view.convert(view.bounds, to: root)) {
+            rules = .all
+        }
+
         // Typed input, secure entry and an explicit per-view mask come before any opt-out:
         // no unmask, class list or region reaches them.
         if Self.isSafetyMasked(view) {
@@ -229,7 +236,7 @@ struct RedactionScanner {
         }
 
         if case .all = rules, isExplicitlyUnmasked(view) {
-            descend(.forcedOnly)
+            descend(.forcedOnly(within: view.convert(view.bounds, to: root)))
             return
         }
 
@@ -273,7 +280,7 @@ struct RedactionScanner {
 
     /// Forced by an option or a fixed rule, short of the safety rules: masked classes and
     /// the always-masked types. An unmask region cannot drop these.
-    private func isForcedByRule(_ view: UIView) -> Bool {
+    func isForcedByRule(_ view: UIView) -> Bool {
         Self.isSafetyMasked(view)
             || isMember(view, ofAny: options.maskedViewClasses)
             || isMember(view, ofAny: Self.alwaysMaskedTypes)

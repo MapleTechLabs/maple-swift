@@ -81,6 +81,9 @@ final class TouchObserver: NSObject, UIGestureRecognizerDelegate {
     private var recognizer: PassthroughGestureRecognizer?
     private let tracker: TouchTracker
     private let recordLocations: Bool
+    /// The scanner's forced-mask rule for one view (masked classes, always-masked
+    /// types), so a touch on one is suppressed before any capture has found it.
+    var isForcedView: (UIView) -> Bool = { _ in false }
 
     /// Regions the last capture masked, in window points. Main thread only.
     ///
@@ -158,7 +161,7 @@ final class TouchObserver: NSObject, UIGestureRecognizerDelegate {
         if gestureMarkerRegions.contains(where: { $0.contains(point) }) { return true }
         var view = touchedView
         while let current = view {
-            if current is UIKeyInput || current.mapleReplayMaskOverride == true { return true }
+            if current is UIKeyInput || current.mapleReplayMaskOverride == true || isForcedView(current) { return true }
             view = current.superview
         }
         return false

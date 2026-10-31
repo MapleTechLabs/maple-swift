@@ -200,6 +200,7 @@ enum CrashRecovery {
         // The manifest is read off disk, so every number in it is untrusted.
         let firstSeq = min(max(0, manifest.nextChunkSeq), Int(UInt32.max) - runs.count)
         var segments: [PreparedSegment] = []
+        var failedRuns = 0
         for (index, run) in runs.enumerated() {
             let seq = firstSeq + index
             guard let start = run.first?.timestamp else { continue }
@@ -236,12 +237,16 @@ enum CrashRecovery {
                     try writer.prepare(video: video, events: events, chunkSeq: seq, isCheckpoint: true)
                 )
             } catch {
+                failedRuns += 1
                 NSLog("[MapleReplay] recovery of \(manifest.sessionId) segment \(seq) failed: \(error)")
             }
         }
         // Nothing encoded: leave the spool for the next launch, which the attempt count
         // above bounds.
         guard !segments.isEmpty else { return nil }
+        // A partial result is kept for a later attempt while attempts remain: deleting the
+        // spool now would lose the runs that failed, which may be a transient writer stall.
+        if failedRuns > 0, manifest.recoveryAttempts < maxRecoveryAttempts { return nil }
 
         // Close out the session row too. A session that never ends stays open forever,
         // and the last spooled frame is the best end time available.

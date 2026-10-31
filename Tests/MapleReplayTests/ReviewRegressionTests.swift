@@ -55,6 +55,22 @@ final class UnmaskScopeTests: XCTestCase {
         XCTAssertTrue(rects.contains { $0.contains(CGRect(x: 10, y: 40, width: 50, height: 50)) }, "\(rects)")
     }
 
+    /// An unmask lifts the automatic rules only inside the unmasked view's frame. A child
+    /// that overflows it (a multiline label, a badge) is masked by the usual rules.
+    func testChildOverflowingAnUnmaskedViewIsMasked() {
+        let root = UIView(frame: CGRect(x: 0, y: 0, width: 400, height: 800))
+        let card = UIView(frame: CGRect(x: 20, y: 20, width: 200, height: 100))
+        card.mapleReplayUnmask()
+        let inside = label(CGRect(x: 10, y: 10, width: 100, height: 20))
+        let overflowing = label(CGRect(x: 10, y: 80, width: 100, height: 60))
+        card.addSubview(inside)
+        card.addSubview(overflowing)
+        root.addSubview(card)
+
+        let rects = RedactionScanner(options: ReplayOptions()).rects(in: root)
+        XCTAssertEqual(rects, [CGRect(x: 30, y: 100, width: 100, height: 60)])
+    }
+
     /// Touches over a SwiftUI mask are suppressed from the first touch of a run, before
     /// any capture has produced masked regions.
     func testMaskMarkerRegionsAreFoundWithoutACapture() {
