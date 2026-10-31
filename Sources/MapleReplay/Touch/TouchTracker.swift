@@ -124,16 +124,38 @@ final class TouchObserver: NSObject, UIGestureRecognizerDelegate {
         shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer
     ) -> Bool { true }
 
+    /// SwiftUI mask regions found when the current gesture began. A marker is a sibling
+    /// of the content it masks, not an ancestor of the touched view, and the last
+    /// capture's regions are empty until the first frame of a run.
+    private var gestureMarkerRegions: [CGRect] = []
+
     fileprivate func report(_ touch: UITouch, in window: UIView, as interaction: TouchInteraction) {
         guard recordLocations else { return }
+        if interaction == .touchStart { gestureMarkerRegions = Self.maskMarkerRegions(in: window) }
         let point = touch.location(in: window)
         guard !isSensitive(point: point, touchedView: touch.view) else { return }
         tracker.record(interaction: interaction, at: point)
     }
 
+    /// Frames of every visible `.mapleReplayMask()` marker, in `root`'s space.
+    static func maskMarkerRegions(in root: UIView) -> [CGRect] {
+        var regions: [CGRect] = []
+        var stack: [UIView] = [root]
+        while let view = stack.popLast() {
+            guard !view.isHidden else { continue }
+            if let marker = view as? ReplayMarkerView {
+                if marker.kind == .mask { regions.append(marker.convert(marker.bounds, to: root)) }
+                continue
+            }
+            stack.append(contentsOf: view.subviews)
+        }
+        return regions
+    }
+
     /// Whether a touch at `point` must not be recorded.
     func isSensitive(point: CGPoint, touchedView: UIView?) -> Bool {
         if maskedRegions.contains(where: { $0.contains(point) }) { return true }
+        if gestureMarkerRegions.contains(where: { $0.contains(point) }) { return true }
         var view = touchedView
         while let current = view {
             if current is UIKeyInput || current.mapleReplayMaskOverride == true { return true }

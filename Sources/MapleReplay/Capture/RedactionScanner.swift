@@ -61,6 +61,9 @@ struct RedactionScanner {
     struct Redaction {
         var rect: CGRect
         var forced: Bool
+        /// Produced inside a nested view controller's screen, which unmask regions of the
+        /// screens around it must not reach.
+        var sealed = false
     }
 
     private struct Walk {
@@ -76,11 +79,9 @@ struct RedactionScanner {
             root, root: root, excluding: excluding, clip: root.bounds,
             animating: false, rules: .all, into: &walk
         )
-        // An unmask region drops what lies wholly inside it, never what it only touches,
-        // and never a forced mask.
-        let kept = walk.redactions.filter { redaction in
-            redaction.forced || !walk.unmaskRegions.contains { $0.contains(redaction.rect) }
-        }
+        // Regions no view controller scoped are applied to the whole window.
+        Self.applyUnmask(walk.unmaskRegions, to: &walk.redactions, from: 0)
+        let kept = walk.redactions
         return Result(
             rects: merge(kept.map(\.rect)),
             sensitive: merge(kept.filter(\.forced).map(\.rect))
@@ -187,7 +188,12 @@ struct RedactionScanner {
         /// Mask this view, and its descendants too when they can draw outside it.
         func mask(forced: Bool) {
             add(forced: forced, extra: overflowRects(of: view, root: root, clip: clip))
-            if !view.clipsToBounds { descend(.inherited(forced: forced)) }
+            guard !view.clipsToBounds else { return }
+            // Drawing layers can sit outside a non-clipping view's bounds too.
+            for rect in contentLayerRects(of: view, root: root, clip: clip, animating: animating) {
+                walk.redactions.append(Redaction(rect: rect, forced: forced))
+            }
+            descend(.inherited(forced: forced))
         }
 
         if let marker = view as? ReplayMarkerView {
@@ -198,8 +204,20 @@ struct RedactionScanner {
             return
         }
 
+        // An unmask region only reaches content of the screen it is on. Bounded at each
+        // view controller's root view, so an alert, a sheet or the incoming screen of a
+        // push drawn over an unmasked card keeps its own masks.
+        let scope = view.next is UIViewController ? (walk.redactions.count, walk.unmaskRegions.count) : nil
+        defer {
+            if let (redactionStart, regionStart) = scope {
+                Self.applyUnmask(Array(walk.unmaskRegions[regionStart...]), to: &walk.redactions, from: redactionStart)
+                walk.unmaskRegions.removeSubrange(regionStart...)
+                for index in redactionStart..<walk.redactions.count { walk.redactions[index].sealed = true }
+            }
+        }
+
         if case .inherited(let forced) = rules {
-            mask(forced: Self.isSafetyMasked(view) || forced)
+            mask(forced: forced || isForcedByRule(view))
             return
         }
 
@@ -251,6 +269,24 @@ struct RedactionScanner {
         }
 
         descend(rules)
+    }
+
+    /// Forced by an option or a fixed rule, short of the safety rules: masked classes and
+    /// the always-masked types. An unmask region cannot drop these.
+    private func isForcedByRule(_ view: UIView) -> Bool {
+        Self.isSafetyMasked(view)
+            || isMember(view, ofAny: options.maskedViewClasses)
+            || isMember(view, ofAny: Self.alwaysMaskedTypes)
+    }
+
+    /// Drop non-forced redactions from `start` on that lie wholly inside a region. Never
+    /// what a region only touches.
+    private static func applyUnmask(_ regions: [CGRect], to redactions: inout [Redaction], from start: Int) {
+        guard !regions.isEmpty, start < redactions.count else { return }
+        let scoped = redactions[start...].filter { redaction in
+            redaction.forced || redaction.sealed || !regions.contains { $0.contains(redaction.rect) }
+        }
+        redactions.replaceSubrange(start..., with: scoped)
     }
 
     /// Masked whatever the options or any opt-out say.
