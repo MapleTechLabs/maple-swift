@@ -10,7 +10,37 @@ import CoreGraphics
 struct CapturedFrame {
     let jpeg: Data
     let timestamp: Date
+    /// Output pixels.
     let size: CGSize
+    /// The window's size in points, which touch coordinates are recorded in. Equal to
+    /// `size` for frames recovered from disk, where the point size was never stored.
+    var pointSize: CGSize
+
+    init(jpeg: Data, timestamp: Date, size: CGSize, pointSize: CGSize? = nil) {
+        self.jpeg = jpeg
+        self.timestamp = timestamp
+        self.size = size
+        self.pointSize = pointSize ?? size
+    }
+}
+
+extension Array where Element == CapturedFrame {
+    /// Consecutive frames of one pixel size each, in order.
+    ///
+    /// A video track has one size. Rotating the device or resizing an iPad window
+    /// mid-segment changes it, and drawing the new frames into the old size distorts
+    /// every one of them, so a size change starts a new segment instead.
+    func runsOfEqualSize() -> [[CapturedFrame]] {
+        var runs: [[CapturedFrame]] = []
+        for frame in self {
+            if let last = runs.last?.last, last.size == frame.size {
+                runs[runs.count - 1].append(frame)
+            } else {
+                runs.append([frame])
+            }
+        }
+        return runs
+    }
 }
 
 /// Fixed-capacity FIFO that evicts the oldest frame on overflow.

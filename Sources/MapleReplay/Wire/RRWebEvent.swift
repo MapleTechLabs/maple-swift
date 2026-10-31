@@ -83,7 +83,9 @@ struct RRWebEvent {
                     "width": width,
                     "height": height,
                     "frameCount": frameCount,
-                    "frameRateType": "constant",
+                    // Frames carry their capture times, so gaps where the main thread
+                    // was busy play back at the length they really lasted.
+                    "frameRateType": "variable",
                     "frameRate": frameRate,
                     "left": 0,
                     "top": 0,
@@ -112,11 +114,18 @@ struct RRWebEvent {
                 // rrweb addresses targets by DOM node id. There are no nodes here, so we
                 // pin to the root id the meta event implies.
                 "id": 0,
-                "x": Int(x.rounded()),
-                "y": Int(y.rounded()),
+                "x": Self.coordinate(x),
+                "y": Self.coordinate(y),
                 "pointerType": 2,
             ]
         )
+    }
+
+    /// A finite, bounded integer. `Int(CGFloat.nan)` traps, and a touch location is
+    /// host-supplied geometry.
+    static func coordinate(_ value: CGFloat) -> Int {
+        guard value.isFinite else { return 0 }
+        return Int(min(100_000, max(-100_000, value)).rounded())
     }
 
     static func breadcrumb(timestamp: Date, category: String, message: String?, data: [String: Any] = [:]) -> RRWebEvent {

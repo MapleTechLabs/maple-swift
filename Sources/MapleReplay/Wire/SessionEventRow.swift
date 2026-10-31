@@ -111,7 +111,9 @@ struct SessionEventRow {
 
     /// One NDJSON line, newline-terminated.
     func ndjson() throws -> Data {
-        var data = try JSONSerialization.data(withJSONObject: json(), options: [.sortedKeys])
+        let object = json()
+        guard JSONSerialization.isValidJSONObject(object) else { throw SegmentWriterError.invalidJSON }
+        var data = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
         data.append(0x0A)
         return data
     }

@@ -12,6 +12,8 @@ enum RedactionPainter {
     /// Redact, resample to the quality tier, and JPEG-compress.
     static func redactAndCompress(_ pending: PendingFrame, options: ReplayOptions) -> CapturedFrame? {
         let source = pending.image
+        guard source.size.width.isFinite, source.size.height.isFinite,
+              source.size.width >= 1, source.size.height >= 1 else { return nil }
         let targetSize = scaledSize(
             for: source.size,
             scale: options.quality.effectiveScale(forPointSize: source.size)
@@ -42,7 +44,7 @@ enum RedactionPainter {
             // half the slack `low` gets. The floor keeps at least two *pixels* as well,
             // which is what the sub-pixel offset needs at tiers below 1x.
             let padding = max(Self.redactionPadding, Self.redactionPadding * scale)
-            for rect in pending.redactions {
+            for rect in pending.redactions where !rect.isNull && !rect.isInfinite {
                 let scaled = rect.applying(CGAffineTransform(scaleX: scale, y: scale))
                 context.fill(scaled.insetBy(dx: -padding, dy: -padding).integral)
             }
@@ -51,7 +53,9 @@ enum RedactionPainter {
         guard let jpeg = redacted.jpegData(compressionQuality: options.quality.frameCompression) else {
             return nil
         }
-        return CapturedFrame(jpeg: jpeg, timestamp: pending.timestamp, size: targetSize)
+        return CapturedFrame(
+            jpeg: jpeg, timestamp: pending.timestamp, size: targetSize, pointSize: source.size
+        )
     }
 
     /// Output size in pixels for a window of `size` points at `scale` pixels per point.

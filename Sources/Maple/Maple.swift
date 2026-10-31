@@ -82,6 +82,12 @@ public enum Maple {
         MapleTracing.shared.flush()
     }
 
+    /// Attach a user id to the session, typically right after sign-in. Pass `""` on
+    /// sign-out.
+    public static func setUserId(_ userId: String) {
+        MapleReplay.shared.setUserId(userId)
+    }
+
     /// Record a product event. Appears inline in the session transcript, stamped with the
     /// trace it happened inside.
     public static func track(_ name: String, properties: [String: String] = [:]) {

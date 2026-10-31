@@ -46,6 +46,11 @@ struct SegmentWriter {
         isCheckpoint: Bool
     ) throws -> PreparedSegment {
         let json = events.map(\.json)
+        // `JSONSerialization` raises an Objective-C exception, which Swift cannot catch,
+        // on a NaN or a non-JSON type. Checking first turns that crash into a lost segment.
+        guard JSONSerialization.isValidJSONObject(json) else {
+            throw SegmentWriterError.invalidJSON
+        }
         let rawJSON = try JSONSerialization.data(withJSONObject: json, options: [.sortedKeys])
 
         guard let gzipped = Gzip.compress(rawJSON) else {
@@ -146,4 +151,5 @@ struct SegmentWriter {
 
 enum SegmentWriterError: Error {
     case compressionFailed
+    case invalidJSON
 }

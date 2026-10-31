@@ -22,6 +22,8 @@ struct SpoolManifest: Codable {
     /// Incremented before each recovery attempt, so a session that reliably kills the
     /// recovery pass is discarded instead of retried on every launch forever.
     var recoveryAttempts: Int
+    /// The session's `ReplayMode` raw value. Optional so spools written by 0.3 decode.
+    var mode: String? = nil
 
     var startDate: Date { Date(timeIntervalSince1970: startedAt) }
 
@@ -82,9 +84,10 @@ final class FrameSpool {
         root: URL,
         manifest: SpoolManifest,
         capacity: Int,
-        byteBudget: Int
+        byteBudget: Int,
+        run: Int = 0
     ) {
-        self.directory = FrameSpool.sessionDirectory(root: root, sessionId: manifest.sessionId)
+        self.directory = FrameSpool.sessionDirectory(root: root, sessionId: manifest.sessionId, run: run)
         self.manifest = manifest
         self.capacity = max(1, capacity)
         self.byteBudget = max(1, byteBudget)
@@ -107,8 +110,12 @@ final class FrameSpool {
         root.appendingPathComponent("spool", isDirectory: true)
     }
 
-    static func sessionDirectory(root: URL, sessionId: String) -> URL {
-        spoolRoot(in: root).appendingPathComponent(sessionId, isDirectory: true)
+    /// One directory per capture run. A session resumed from the background starts a
+    /// new run while the previous run's teardown may still be deleting its own spool, and
+    /// sharing a directory would let that teardown delete the live frames.
+    static func sessionDirectory(root: URL, sessionId: String, run: Int = 0) -> URL {
+        let name = run == 0 ? sessionId : "\(sessionId).\(run)"
+        return spoolRoot(in: root).appendingPathComponent(name, isDirectory: true)
     }
 
     static let manifestName = "manifest.json"
@@ -197,7 +204,9 @@ final class FrameSpool {
         // `%ld`, not `%d`: epoch milliseconds do not fit in the 32 bits `%d` takes, and
         // the truncated value round-trips back to a 1970 timestamp — which then becomes
         // the recovered segment's start time and the crashed session's `end_time`.
-        String(format: "%09ld-%013ld.%@", sequence, timestamp.epochMilliseconds, frameExtension)
+        // Clamped at zero: a clock set before 1970 would print a minus sign, which the
+        // parser below reads as a third field and drops the frame.
+        String(format: "%09ld-%013ld.%@", max(0, sequence), max(0, timestamp.epochMilliseconds), frameExtension)
     }
 
     static func parseFrameName(_ name: String) -> (sequence: Int, timestamp: Date)? {

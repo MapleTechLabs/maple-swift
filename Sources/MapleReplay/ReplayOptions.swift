@@ -87,12 +87,68 @@ public enum ReplayQuality: String, Sendable, CaseIterable {
 
 public struct ReplayOptions: Sendable {
     /// Frames captured per second. 1 is the default across every mobile replay SDK
-    /// worth copying — replay is for understanding flow, not animation.
+    /// worth copying: replay is for understanding flow, not animation. Clamped to 1...10.
     public var frameRate: Int = 1
 
     public var quality: ReplayQuality = .medium
 
-    public var flushPolicy: FlushPolicy = .defaultContinuous
+    // MARK: Sampling
+    //
+    // Rolled once per session, when it starts. A session resumed from the background
+    // keeps the decision it already had.
+
+    /// Fraction of sessions recorded from their first frame, uploaded every
+    /// `segmentDuration` seconds. 0...1.
+    public var sessionSampleRate: Double = 1
+
+    /// Of the sessions `sessionSampleRate` did not pick, the fraction that keep the last
+    /// `errorBufferWindow` seconds in memory and upload it on `flush(trigger:)` (wire it
+    /// to your error handler) or after a crash. From that flush on the session records
+    /// like a sampled one. 0...1.
+    public var onErrorSampleRate: Double = 0
+
+    /// Seconds per uploaded segment in a recorded session. Clamped to 1...60.
+    public var segmentDuration: TimeInterval = 5
+
+    /// Seconds of video an error-buffered session holds before something flushes it.
+    /// Clamped to 1...120.
+    public var errorBufferWindow: TimeInterval = 30
+
+    /// The recording mode as a single value. Kept for 0.3 callers; it maps onto the
+    /// sampling fields above.
+    @available(*, deprecated, message: "Use sessionSampleRate, onErrorSampleRate, segmentDuration and errorBufferWindow")
+    public var flushPolicy: FlushPolicy {
+        get {
+            sessionSampleRate > 0 || onErrorSampleRate <= 0
+                ? .continuous(segmentDuration: segmentDuration)
+                : .buffered(window: errorBufferWindow)
+        }
+        set {
+            switch newValue {
+            case .continuous(let duration):
+                sessionSampleRate = 1
+                onErrorSampleRate = 0
+                segmentDuration = duration
+            case .buffered(let window):
+                sessionSampleRate = 0
+                onErrorSampleRate = 1
+                errorBufferWindow = window
+            }
+        }
+    }
+
+    // MARK: Session lifetime
+
+    /// How long the app can sit in the background before coming back starts a new
+    /// session. Shorter absences (copying a code from Messages, a phone call) resume the
+    /// same session, so one visit stays one recording. 0 rotates on every background.
+    public var backgroundSessionTimeout: TimeInterval = 30
+
+    // MARK: Touches
+
+    /// Record where the user touched, so the replay shows what caused each change.
+    /// Touches over masked regions are never recorded either way.
+    public var recordTouches: Bool = true
 
     // MARK: Masking
     //
@@ -171,4 +227,49 @@ public struct ReplayOptions: Sendable {
     public var maxTotalSpoolBytes: Int = 48 * 1024 * 1024
 
     public init() {}
+
+    /// Every numeric option forced into a range the recorder can run with.
+    ///
+    /// Options come from host code and plists, so NaN, infinity and negatives are all
+    /// reachable, and an infinite window would trap converting to a frame count.
+    func normalized() -> ReplayOptions {
+        var options = self
+        options.frameRate = min(10, max(1, frameRate))
+        options.sessionSampleRate = Self.unitInterval(sessionSampleRate)
+        options.onErrorSampleRate = Self.unitInterval(onErrorSampleRate)
+        options.segmentDuration = Self.clamp(segmentDuration, 1...60, fallback: 5)
+        options.errorBufferWindow = Self.clamp(errorBufferWindow, 1...120, fallback: 30)
+        options.backgroundSessionTimeout = Self.clamp(backgroundSessionTimeout, 0...86_400, fallback: 30)
+        options.maxSpoolBytes = max(1024 * 1024, maxSpoolBytes)
+        options.maxTotalSpoolBytes = max(options.maxSpoolBytes, maxTotalSpoolBytes)
+        return options
+    }
+
+    private static func unitInterval(_ value: Double) -> Double {
+        clamp(value, 0...1, fallback: 0)
+    }
+
+    private static func clamp(_ value: Double, _ range: ClosedRange<Double>, fallback: Double) -> Double {
+        guard value.isFinite else { return value == .infinity ? range.upperBound : fallback }
+        return min(range.upperBound, max(range.lowerBound, value))
+    }
+}
+
+/// What one session records, decided when it starts.
+enum ReplayMode: String, Sendable {
+    /// Recorded from the start, a segment every `segmentDuration`.
+    case record
+    /// Last `errorBufferWindow` seconds held until a flush promotes it to `record`.
+    case buffer
+    /// Not recorded. The session still exists, so spans and events stay joined to it.
+    case off
+
+    static func roll(
+        _ options: ReplayOptions,
+        random: () -> Double = { Double.random(in: 0..<1) }
+    ) -> ReplayMode {
+        if options.sessionSampleRate > 0, random() < options.sessionSampleRate { return .record }
+        if options.onErrorSampleRate > 0, random() < options.onErrorSampleRate { return .buffer }
+        return .off
+    }
 }

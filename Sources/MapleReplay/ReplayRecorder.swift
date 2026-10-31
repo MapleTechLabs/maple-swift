@@ -8,27 +8,50 @@ import UIKit
 ///  - Redaction, compression, buffering, and encoding run on `workQueue`, a serial queue.
 ///
 /// The unredacted `UIImage` exists only in the hop between the two, and is never retained
-/// or written. That hop is unavoidable — you cannot redact what you have not yet captured.
+/// or written. That hop is unavoidable: you cannot redact what you have not yet captured.
 final class ReplayRecorder {
+    /// How frames become segments.
+    enum Capture: Equatable {
+        /// A segment every `segmentDuration` seconds.
+        case continuous(segmentDuration: TimeInterval)
+        /// Hold the last `window` seconds; emit only on `flush`.
+        case buffered(window: TimeInterval)
+
+        var retainedSeconds: TimeInterval {
+            switch self {
+            case .continuous(let duration): return duration
+            case .buffered(let window): return window
+            }
+        }
+    }
+
     private let options: ReplayOptions
     private let sessionId: String
     private let writer: SegmentWriter
-    private let touches = TouchTracker()
-    private let touchObserver: TouchObserver
+    let touches = TouchTracker()
+    let touchObserver: TouchObserver
 
     private let workQueue = DispatchQueue(label: "dev.maple.replay.work", qos: .utility)
+    private var capture: Capture
     private var buffer: FrameRingBuffer
     /// Disk mirror of `buffer`. Nil when crash recovery is disabled.
     private let spool: FrameSpool?
     private var timer: DispatchSourceTimer?
 
-    private var chunkSeq = 0
+    private let sequencer: ChunkSequencer
     private var segmentStart: Date?
+    /// Main thread only.
     private var isRunning = false
+    /// `workQueue` only. Set while a capture is queued on or running on the main thread.
+    ///
+    /// When the main thread stalls, every timer tick would otherwise queue another
+    /// capture, and the moment it frees up they all run back to back: a burst of full
+    /// view-tree scans landing on exactly the frames after a hang.
+    private var captureInFlight = false
 
-    /// Segments produced so far, for inspection. Only the records — the bodies are
-    /// handed to `onSegment` and released, so a long session does not accumulate every
-    /// chunk it ever uploaded in memory.
+    /// Segments produced so far, for inspection. Only the records: the bodies are handed
+    /// to `onSegment` and released, so a long session does not accumulate every chunk it
+    /// ever uploaded in memory.
     private(set) var artifacts: [SegmentArtifacts] = []
 
     /// Called on `workQueue` as each segment is prepared, with the bytes to upload.
@@ -37,16 +60,23 @@ final class ReplayRecorder {
     init(
         sessionId: String,
         options: ReplayOptions,
+        capture: Capture? = nil,
+        sequencer: ChunkSequencer = ChunkSequencer(),
+        run: Int = 0,
+        mode: ReplayMode = .record,
         startedAt: Date = Date(),
         serviceName: String = "ios-app",
         environment: String? = nil,
         userId: String = ""
     ) {
+        let options = options.normalized()
         self.sessionId = sessionId
         self.options = options
-        self.touchObserver = TouchObserver(tracker: touches)
+        self.capture = capture ?? .continuous(segmentDuration: options.segmentDuration)
+        self.sequencer = sequencer
+        self.touchObserver = TouchObserver(tracker: touches, recordLocations: options.recordTouches)
         let capacity = FrameRingBuffer.capacity(
-            forSeconds: options.flushPolicy.retainedSeconds,
+            forSeconds: self.capture.retainedSeconds,
             frameRate: options.frameRate
         )
         self.buffer = FrameRingBuffer(capacity: capacity)
@@ -69,11 +99,13 @@ final class ReplayRecorder {
                     serviceName: serviceName,
                     environment: environment,
                     userId: userId,
-                    nextChunkSeq: 0,
-                    recoveryAttempts: 0
+                    nextChunkSeq: sequencer.peek,
+                    recoveryAttempts: 0,
+                    mode: mode.rawValue
                 ),
                 capacity: capacity,
-                byteBudget: options.maxSpoolBytes
+                byteBudget: options.maxSpoolBytes,
+                run: run
             )
             : nil
     }
@@ -96,7 +128,7 @@ final class ReplayRecorder {
     func start() {
         guard !isRunning else { return }
         isRunning = true
-        segmentStart = Date()
+        workQueue.async { [weak self] in self?.segmentStart = Date() }
 
         if let window = ViewCapture.activeWindow() {
             touchObserver.attach(to: window)
@@ -105,7 +137,7 @@ final class ReplayRecorder {
         // A DispatchSourceTimer rather than a Timer: an NSTimer scheduled in the default
         // run-loop mode stops firing while a scroll view is tracking, which would silently
         // drop every frame during exactly the interactions worth recording.
-        let interval = 1.0 / Double(max(1, options.frameRate))
+        let interval = 1.0 / Double(options.frameRate)
         let timer = DispatchSource.makeTimerSource(queue: workQueue)
         timer.schedule(deadline: .now() + interval, repeating: interval, leeway: .milliseconds(100))
         timer.setEventHandler { [weak self] in self?.tick() }
@@ -120,6 +152,7 @@ final class ReplayRecorder {
         timer?.cancel()
         timer = nil
         touchObserver.detach()
+        touchObserver.maskedRegions = []
 
         // Queued behind any in-flight flush, so the spool outlives the frames it is
         // protecting and is deleted only once they have been written as a segment.
@@ -129,38 +162,64 @@ final class ReplayRecorder {
 
     // MARK: - Capture
 
+    /// Runs on `workQueue`.
     private func tick() {
+        guard !captureInFlight else { return }
+        captureInFlight = true
         DispatchQueue.main.async { [weak self] in
-            guard let self, self.isRunning else { return }
-            guard let pending = ViewCapture.capture(options: self.options) else { return }
-            self.workQueue.async { self.ingest(pending) }
+            guard let self else { return }
+            let pending = self.captureOnMain()
+            self.workQueue.async {
+                self.captureInFlight = false
+                if let pending { self.ingest(pending) }
+            }
         }
     }
 
-    private func ingest(_ pending: PendingFrame) {
+    @MainActor
+    private func captureOnMain() -> PendingFrame? {
+        guard isRunning, let window = ViewCapture.activeWindow() else { return nil }
+        // The key window changes when an app presents a window of its own; touches have
+        // to follow it or they stop being recorded without any sign.
+        if touchObserver.attachedWindow !== window { touchObserver.attach(to: window) }
+        guard let pending = ViewCapture.capture(window: window, options: options) else { return nil }
+        touchObserver.maskedRegions = pending.sensitive
+        return pending
+    }
+
+    /// Feed one captured frame through redaction and into the buffer. `workQueue` only;
+    /// internal so tests can drive the pipeline without a running app.
+    func ingest(_ pending: PendingFrame) {
         guard let frame = RedactionPainter.redactAndCompress(pending, options: options) else { return }
+        ingest(frame)
+    }
+
+    func ingest(_ frame: CapturedFrame) {
         buffer.append(frame)
-        // The frame reaching the spool is the same object the buffer holds — already
-        // redacted and compressed by the painter above. There is no path by which an
-        // unredacted frame reaches disk.
+        // The frame reaching the spool is the same value the buffer holds, already
+        // redacted and compressed. There is no path by which an unredacted frame
+        // reaches disk.
         spool?.append(frame)
 
-        if case .continuous(let segmentDuration) = options.flushPolicy {
+        switch capture {
+        case .continuous(let segmentDuration):
             let start = segmentStart ?? frame.timestamp
             if frame.timestamp.timeIntervalSince(start) >= segmentDuration {
                 emitSegment(reason: "interval")
             }
+        case .buffered:
+            // Touches age out with the video they belong to.
+            if let oldest = buffer.frames.first?.timestamp { touches.discard(olderThan: oldest) }
         }
     }
 
     // MARK: - Flush
 
-    /// Emit whatever is buffered. This is the seam error-triggered capture hangs off:
-    /// in buffered mode nothing is emitted until someone calls this.
+    /// Emit whatever is buffered. In buffered mode nothing is emitted until someone calls
+    /// this; error-triggered capture hangs off it.
     ///
     /// `completion` runs on `workQueue` once the segment has been prepared and handed to
-    /// `onSegment` — which is where its upload starts, not where it finishes. Waiting for
-    /// the network is the transport's job.
+    /// `onSegment`, which is where its upload starts, not where it finishes.
     func flush(trigger: String, completion: (() -> Void)? = nil) {
         workQueue.async { [weak self] in
             self?.emitSegment(reason: trigger)
@@ -168,48 +227,105 @@ final class ReplayRecorder {
         }
     }
 
+    /// Emit the buffered window and record continuously from here on.
+    ///
+    /// The window is emitted before the buffer shrinks to segment size, or the resize
+    /// would evict the seconds before the error, which are the reason for the flush.
+    func promote(to segmentDuration: TimeInterval, trigger: String, completion: (() -> Void)? = nil) {
+        workQueue.async { [weak self] in
+            guard let self else { completion?(); return }
+            self.emitSegment(reason: trigger)
+            self.capture = .continuous(segmentDuration: segmentDuration)
+            let capacity = FrameRingBuffer.capacity(forSeconds: segmentDuration, frameRate: self.options.frameRate)
+            self.buffer.resize(capacity: capacity)
+            self.spool?.resize(capacity: capacity)
+            completion?()
+        }
+    }
+
     /// Must run on `workQueue`.
     private func emitSegment(reason: String) {
         let frames = buffer.drain()
-        guard !frames.isEmpty else { return }
-
-        let seq = chunkSeq
-        chunkSeq += 1
-        let start = frames.first?.timestamp ?? Date()
-        let end = frames.last?.timestamp ?? start
         segmentStart = Date()
+        guard let first = frames.first, let last = frames.last else { return }
+
+        let runs = frames.runsOfEqualSize()
+        let firstSeq = sequencer.take(runs.count)
 
         // Drop the disk copy at the same moment the buffer is drained, before encoding
         // rather than after. The two copies then fail identically: a crash during encode
         // loses the segment from memory and disk alike. Clearing after a successful write
         // would instead leave a window in which recovery re-emits a segment that was
         // already emitted, under a sequence number that is now taken.
-        spool?.clearFrames(nextChunkSeq: chunkSeq)
+        spool?.clearFrames(nextChunkSeq: sequencer.peek)
 
-        do {
-            let temporaryURL = FileManager.default.temporaryDirectory
-                .appendingPathComponent("maple-segment-\(seq)-\(UUID().uuidString).mp4")
-            let video = try VideoEncoder.encode(frames: frames, options: options, to: temporaryURL)
+        // Up to the end of the last frame's display, so a tap during the final second
+        // belongs to this segment rather than falling before the next one's start.
+        let videoEnd = last.timestamp.addingTimeInterval(1 / Double(options.frameRate))
+        let touchSamples = touches.drain(until: videoEnd, notBefore: first.timestamp)
 
-            let events = SegmentEvents.build(
-                sessionId: sessionId,
-                chunkSeq: seq,
-                video: video,
-                start: start,
-                reason: reason,
-                extra: touches.drain(until: end)
-            )
+        for (index, run) in runs.enumerated() {
+            let seq = firstSeq + index
+            guard let start = run.first?.timestamp else { continue }
+            do {
+                let temporaryURL = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("maple-segment-\(seq)-\(UUID().uuidString).mp4")
+                let video = try VideoEncoder.encode(frames: run, options: options, to: temporaryURL)
 
-            // Every segment stands alone: it opens with a meta event and an IDR-keyframed
-            // video, so any segment is a valid seek target. On the web side that is what
-            // `is_checkpoint` marks, so every mobile chunk is a checkpoint.
-            let segment = try writer.prepare(
-                video: video, events: events, chunkSeq: seq, isCheckpoint: true
-            )
-            artifacts.append(segment.artifacts)
-            onSegment?(segment)
-        } catch {
-            NSLog("[MapleReplay] segment \(seq) failed: \(error)")
+                let events = SegmentEvents.build(
+                    sessionId: sessionId,
+                    chunkSeq: seq,
+                    video: video,
+                    start: start,
+                    reason: reason,
+                    pointSize: run.first?.pointSize,
+                    touches: touchSamples
+                )
+
+                // Every segment stands alone: it opens with a meta event and an
+                // IDR-keyframed video, so any segment is a valid seek target. On the web
+                // side that is what `is_checkpoint` marks, so every mobile chunk is one.
+                let segment = try writer.prepare(
+                    video: video, events: events, chunkSeq: seq, isCheckpoint: true
+                )
+                artifacts.append(segment.artifacts)
+                onSegment?(segment)
+            } catch {
+                NSLog("[MapleReplay] segment \(seq) failed: \(error)")
+            }
         }
+    }
+
+    /// Wait for everything queued so far. Test seam.
+    func drainQueue() {
+        workQueue.sync {}
+    }
+}
+
+/// Hands out a session's chunk sequence numbers.
+///
+/// Shared by every capture run of one session. A run retiring on the way to the
+/// background can still be encoding its tail when the app comes back and the next run
+/// starts, so neither can know where the other's numbers end; drawing from one counter
+/// is what keeps two segments from claiming the same `x-maple-chunk-seq`.
+final class ChunkSequencer: @unchecked Sendable {
+    private let lock = NSLock()
+    private var next: Int
+
+    init(next: Int = 0) {
+        self.next = max(0, next)
+    }
+
+    /// Reserve `count` consecutive numbers and return the first.
+    func take(_ count: Int = 1) -> Int {
+        lock.lock(); defer { lock.unlock() }
+        let first = next
+        next += max(0, count)
+        return first
+    }
+
+    var peek: Int {
+        lock.lock(); defer { lock.unlock() }
+        return next
     }
 }

@@ -47,7 +47,7 @@ final class RRWebEventTests: XCTestCase {
         XCTAssertEqual(payload?["duration"] as? Int, 5_000)
         XCTAssertEqual(payload?["encoding"] as? String, "h264")
         XCTAssertEqual(payload?["container"] as? String, "mp4")
-        XCTAssertEqual(payload?["frameRateType"] as? String, "constant")
+        XCTAssertEqual(payload?["frameRateType"] as? String, "variable")
         XCTAssertEqual(payload?["frameRate"] as? Int, 1)
         XCTAssertEqual(payload?["frameCount"] as? Int, 5)
         XCTAssertEqual(payload?["left"] as? Int, 0)

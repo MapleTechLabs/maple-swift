@@ -10,6 +10,8 @@ struct PendingFrame {
     let image: UIImage
     let redactions: [CGRect]
     let timestamp: Date
+    /// Forced masks only, in window points: where touches must not be recorded.
+    var sensitive: [CGRect] = []
 }
 
 enum ViewCapture {
@@ -20,6 +22,11 @@ enum ViewCapture {
     @MainActor
     static func capture(options: ReplayOptions) -> PendingFrame? {
         guard let window = activeWindow() else { return nil }
+        return capture(window: window, options: options)
+    }
+
+    @MainActor
+    static func capture(window: UIWindow, options: ReplayOptions) -> PendingFrame? {
         let bounds = window.bounds
         guard bounds.width > 0, bounds.height > 0 else { return nil }
 
@@ -34,7 +41,7 @@ enum ViewCapture {
         // In particular, *not* `window.layoutIfNeeded()`, which used to run here. It
         // applies pending layout to the view tree without committing it to the render
         // server, which is exactly how the two fall out of step — see the draw below.
-        let redactions = RedactionScanner(options: options).rects(in: window)
+        let scan = RedactionScanner(options: options).scan(in: window)
 
         let format = UIGraphicsImageRendererFormat()
         // Rasterise at the tier's scale, not at the device's. Capturing above the tier
@@ -45,6 +52,7 @@ enum ViewCapture {
         format.opaque = true
 
         let renderer = UIGraphicsImageRenderer(bounds: bounds, format: format)
+        var drew = false
         let image = renderer.image { _ in
             // `drawHierarchy` rather than `layer.render(in:)`.
             //
@@ -73,10 +81,15 @@ enum ViewCapture {
             // This is what every mobile replay recorder does; sentry-cocoa's
             // `SentryDefaultViewRenderer` and `SentryViewRendererV2` both pass `false`
             // unconditionally, and neither calls `layoutIfNeeded` or `CATransaction.flush`.
-            window.drawHierarchy(in: bounds, afterScreenUpdates: false)
+            drew = window.drawHierarchy(in: bounds, afterScreenUpdates: false)
         }
+        // False when the window has nothing committed to draw (off screen, mid-teardown).
+        // The bitmap is then blank, and a blank frame in a replay reads as a bug.
+        guard drew else { return nil }
 
-        return PendingFrame(image: image, redactions: redactions, timestamp: Date())
+        return PendingFrame(
+            image: image, redactions: scan.rects, timestamp: Date(), sensitive: scan.sensitive
+        )
     }
 
     @MainActor
