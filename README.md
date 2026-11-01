@@ -481,6 +481,38 @@ changes at all.
 Four times the pixels costs 1.7× the MP4 and 1.2× the chunk: H.264 spends its bits on the parts of
 the frame that change, and resolution mostly buys sharper still detail rather than more bitstream.
 
+## Privacy manifest and App Store
+
+`MapleCore`, `MapleTracing` and `MapleReplay` each ship a `PrivacyInfo.xcprivacy`, which Xcode
+merges into the app's privacy report (Product → Archive → Generate Privacy Report). Use that report
+for your App Store privacy label. The SDK does no tracking, contacts no tracking domains and never
+reads IDFA, IDFV or the Keychain.
+
+| Target | Declares |
+| --- | --- |
+| `MapleCore` | Nothing collected. Holds the session id file and the upload path. |
+| `MapleTracing` | Crash data, performance data, other diagnostic data (request URLs, device model), product interaction (screen views). Not linked. |
+| `MapleReplay` | Other user content (masked frames), product interaction (taps), user ID. Linked, because `setUserId` stamps the id on the session. Also the file-timestamp API with reason `C617.1`, for clearing stale encoder files in the app's temp directory. |
+
+All purposes are app functionality and analytics. Adjust your label if your usage differs: if you
+never call `setUserId`, replay data is not linked to the user. If you put PII into span attributes
+yourself, the tracing data becomes linked too.
+
+What review looks at, and why it passes:
+
+- **No private API.** The redaction scanner compares class *names* (`_UILabelLayer` and others)
+  but never calls a private selector.
+- **Swizzling** (`URLSessionTask.resume`, `UIViewController` appearance) uses the public runtime
+  functions.
+- **Capture** is `drawHierarchy` into a `UIGraphicsImageRenderer`. **Touches** come from a
+  passive gesture recognizer, not a swizzled `sendEvent:`.
+- **Crashes** come from MetricKit, not signal handlers or Mach exception ports.
+
+If you add a call from Apple's
+[required-reason list](https://developer.apple.com/documentation/bundleresources/describing-use-of-required-reason-api),
+declare it in that target's manifest. A file size read goes through `.fileSizeKey`, never
+`attributesOfItem`, which counts as a file-timestamp API.
+
 ## Development
 
 ```bash

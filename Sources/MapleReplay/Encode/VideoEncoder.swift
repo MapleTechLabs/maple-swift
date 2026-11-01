@@ -167,8 +167,9 @@ enum VideoEncoder {
             )
         }
 
-        let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
-        let byteSize = (attributes?[.size] as? Int) ?? 0
+        // `fileSizeKey`, not `attributesOfItem`: Apple lists the latter as a required-reason
+        // file-timestamp API whatever attribute is read.
+        let byteSize = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
 
         return EncodedVideo(
             url: url,

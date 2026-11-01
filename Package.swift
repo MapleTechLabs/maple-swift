@@ -15,15 +15,23 @@ let package = Package(
         // The session/trace join, and the request plumbing both signals share.
         // Exists so `MapleReplay` and `MapleTracing` stay siblings: an app that wants
         // only tracing should not link a screenshot recorder to get it.
-        .target(name: "MapleCore", swiftSettings: [.swiftLanguageMode(.v5)]),
+        // Each code-bearing target ships its own privacy manifest; Xcode merges them
+        // into the app's privacy report.
+        .target(
+            name: "MapleCore",
+            resources: [.copy("PrivacyInfo.xcprivacy")],
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
         .target(
             name: "MapleTracing",
             dependencies: ["MapleCore"],
+            resources: [.copy("PrivacyInfo.xcprivacy")],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
         .target(
             name: "MapleReplay",
             dependencies: ["MapleCore"],
+            resources: [.copy("PrivacyInfo.xcprivacy")],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
         .target(
