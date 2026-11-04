@@ -73,7 +73,7 @@ final class ReplayE2ETests: ReplayE2ETestCase {
     // MARK: - Masking
 
     func testSecretTextAndSecureFieldAreBlackInTheVideoWhilePlainViewIsNot() throws {
-        launch()
+        launch(["MAPLE_MASK_STYLE": "solid"])
         let row = try activeRow()
         let secret = try frame(of: "e2e.secret")
         let textField = try frame(of: "e2e.textField")
@@ -105,8 +105,47 @@ final class ReplayE2ETests: ReplayE2ETestCase {
         XCTAssertLessThan(control.g, 90, "plain view should be unmasked magenta, got \(control)")
     }
 
-    func testTypedTextStaysMaskedAndKeyboardTouchesAreNotRecorded() throws {
+    /// The default skeleton style on the same screen: black glyphs on a light surface, so
+    /// any dark pixel left inside a mask is a glyph that survived.
+    func testSkeletonMasksLeaveNoGlyphPixelsWhilePlainViewIsNot() throws {
         launch()
+        let row = try activeRow()
+        let window = windowSize
+        let plain = try frame(of: "e2e.plain")
+        let secret = try frame(of: "e2e.secret")
+        let keypad = try (1...9).map { try self.frame(of: "e2e.key.\($0)") }.reduce(CGRect.null) { $0.union($1) }
+        let visibleSince = Date().epochMs
+
+        func lastFrame(after start: Int, _ what: String) throws -> (VideoFrame, CGFloat) {
+            let blob = try waitFor(what) { try blobs(for: row.sessionId).first { $0.startMs > start } }
+            let video = try blob.decodeVideo()
+            return (try XCTUnwrap(video.frames.last), CGFloat(video.width) / window.width)
+        }
+        func assertNoGlyphs(_ name: String, _ rect: CGRect, in frame: VideoFrame, scale: CGFloat) {
+            let darkest = frame.minLuma(in: rect.scaled(by: scale).insetBy(dx: 3, dy: 3))
+            XCTAssertGreaterThan(darkest, 120, "\(name) has a dark pixel (luma \(darkest)) inside its skeleton mask")
+        }
+
+        // Before typing: the keyboard would cover the keypad afterwards.
+        let (before, scale) = try lastFrame(after: visibleSince, "a segment recorded after the screen was laid out")
+        assertNoGlyphs("secret label", secret, in: before, scale: scale)
+        assertNoGlyphs("keypad", keypad, in: before, scale: scale)
+        let control = before.meanColor(in: plain.scaled(by: scale).insetBy(dx: 6, dy: 6))
+        XCTAssertGreaterThan(control.r, 170, "plain view should be unmasked magenta, got \(control)")
+        XCTAssertLessThan(control.g, 90, "plain view should be unmasked magenta, got \(control)")
+
+        element("e2e.textField").tap()
+        element("e2e.textField").typeText("jane@example.com")
+        element("e2e.secureField").tap()
+        element("e2e.secureField").typeText("hunter2")
+        let fields = try ["e2e.textField", "e2e.secureField"].map { ($0, try frame(of: $0)) }
+        let typedAt = Date().epochMs
+        let (after, _) = try lastFrame(after: typedAt, "a segment recorded after typing")
+        for (name, rect) in fields { assertNoGlyphs(name, rect, in: after, scale: scale) }
+    }
+
+    func testTypedTextStaysMaskedAndKeyboardTouchesAreNotRecorded() throws {
+        launch(["MAPLE_MASK_STYLE": "solid"])
         let row = try activeRow()
         element("e2e.textField").tap()
         element("e2e.textField").typeText("jane@example.com")

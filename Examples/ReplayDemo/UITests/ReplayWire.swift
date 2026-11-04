@@ -214,6 +214,20 @@ struct VideoFrame {
 
     /// Brightest pixel's luma in `rect`: a mask must leave nothing light behind, so the
     /// maximum is the honest test, not the mean.
+    func minLuma(in rect: CGRect) -> Double {
+        let clipped = rect.integral.intersection(CGRect(x: 0, y: 0, width: width, height: height))
+        guard !clipped.isNull, clipped.width > 0, clipped.height > 0 else { return 255 }
+        var darkest = 255.0
+        for y in Int(clipped.minY)..<Int(clipped.maxY) {
+            for x in Int(clipped.minX)..<Int(clipped.maxX) {
+                let offset = y * bytesPerRow + x * 4
+                let luma = 0.0722 * Double(bytes[offset]) + 0.7152 * Double(bytes[offset + 1]) + 0.2126 * Double(bytes[offset + 2])
+                darkest = min(darkest, luma)
+            }
+        }
+        return darkest
+    }
+
     func maxLuma(in rect: CGRect) -> Double {
         let clipped = rect.integral.intersection(CGRect(x: 0, y: 0, width: width, height: height))
         guard !clipped.isNull, clipped.width > 0, clipped.height > 0 else { return 0 }
