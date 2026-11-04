@@ -1,6 +1,12 @@
 import Foundation
 import UIKit
 
+/// What a redaction covers, so the painter can draw a placeholder of the right shape.
+/// Advisory only: it changes the look of a mask, never whether a region is masked.
+enum MaskKind: Sendable, Equatable {
+    case text, image, unknown
+}
+
 /// Walks the view hierarchy to locate regions that must be painted over before a frame
 /// is retained.
 ///
@@ -52,6 +58,8 @@ struct RedactionScanner {
     struct Result: Equatable {
         /// Everything to paint over.
         var rects: [CGRect]
+        /// What each of `rects` covers, same order.
+        var kinds: [MaskKind] = []
         /// The subset masked no matter what (typed input, explicit masks, always-masked
         /// classes), where a touch's position must not be recorded either.
         var sensitive: [CGRect]
@@ -61,6 +69,7 @@ struct RedactionScanner {
     struct Redaction {
         var rect: CGRect
         var forced: Bool
+        var kind: MaskKind = .unknown
         /// Produced inside a nested view controller's screen, which unmask regions of the
         /// screens around it must not reach.
         var sealed = false
@@ -81,10 +90,11 @@ struct RedactionScanner {
         )
         // Regions no view controller scoped are applied to the whole window.
         Self.applyUnmask(walk.unmaskRegions, to: &walk.redactions, from: 0)
-        let kept = walk.redactions
+        let kept = merge(walk.redactions.map { ($0.rect, $0.kind) })
         return Result(
-            rects: merge(kept.map(\.rect)),
-            sensitive: merge(kept.filter(\.forced).map(\.rect))
+            rects: kept.map(\.0),
+            kinds: kept.map(\.1),
+            sensitive: merge(walk.redactions.filter(\.forced).map { ($0.rect, MaskKind.unknown) }).map(\.0)
         )
     }
 
@@ -178,8 +188,9 @@ struct RedactionScanner {
         let ownRects = [modelRect, presentationRect].compactMap { $0 }
 
         func add(forced: Bool, extra: [CGRect] = []) {
+            let kind = Self.kind(of: view)
             for rect in ownRects + extra {
-                walk.redactions.append(Redaction(rect: rect, forced: forced))
+                walk.redactions.append(Redaction(rect: rect, forced: forced, kind: kind))
             }
         }
         func descend(_ rules: Rules) {
@@ -620,14 +631,21 @@ struct RedactionScanner {
     /// column of slightly-overlapping rows collapses into one full-screen mask. That was
     /// observed here — 100% coverage from a single rect. Containment can only ever
     /// shrink the set, so it cannot run away.
-    private func merge(_ rects: [CGRect]) -> [CGRect] {
+    private func merge(_ rects: [(CGRect, MaskKind)]) -> [(CGRect, MaskKind)] {
         guard rects.count > 1 else { return rects }
         // Largest first, so a container is seen before the rects it swallows.
-        let sorted = rects.sorted { $0.width * $0.height > $1.width * $1.height }
-        var kept: [CGRect] = []
-        for rect in sorted where !kept.contains(where: { $0.contains(rect) }) {
-            kept.append(rect)
+        let sorted = rects.sorted { $0.0.width * $0.0.height > $1.0.width * $1.0.height }
+        var kept: [(CGRect, MaskKind)] = []
+        for entry in sorted where !kept.contains(where: { $0.0.contains(entry.0) }) {
+            kept.append(entry)
         }
         return kept
+    }
+
+    /// The placeholder shape for a masked view. Text inputs read as text, never image.
+    private static func kind(of view: UIView) -> MaskKind {
+        if view is UILabel || view is UIKeyInput || view is UITextView { return .text }
+        if view is UIImageView { return .image }
+        return .unknown
     }
 }

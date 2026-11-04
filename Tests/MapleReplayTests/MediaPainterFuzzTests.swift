@@ -4,7 +4,7 @@ import XCTest
 
 /// `RedactionPainter` with hostile sizes and rects. The painter is the last step before
 /// a frame may be retained, so whatever the scanner hands it, a finite rect over the
-/// image must come out black and nothing may crash.
+/// image must be fully replaced (black in the solid style) and nothing may crash.
 final class MediaPainterFuzzTests: XCTestCase {
     func testScaledSizeIsEvenAndAtLeastTwoForAnyInput() {
         for seed in PrivacyFuzzConfig.seeds(default: 300) {
@@ -34,6 +34,7 @@ final class MediaPainterFuzzTests: XCTestCase {
             let size = randomSourceSize(&rng)
             var options = ReplayOptions()
             options.quality = rng.pick(ReplayQuality.allCases)
+            options.maskStyle = .solid
             let rects = (0..<rng.int(0...12)).map { _ in randomRect(&rng, in: size) }
             let pending = PendingFrame(
                 image: PrivacyFuzzPalette.solidImage(.white, size: size), redactions: rects, timestamp: Date()
@@ -82,6 +83,7 @@ final class MediaPainterFuzzTests: XCTestCase {
         let size = CGSize(width: 393, height: 852)
         var options = ReplayOptions()
         options.quality = .low
+        options.maskStyle = .solid
         let label = CGRect(x: 20, y: 800, width: 200, height: 30)
         let pending = PendingFrame(image: PrivacyFuzzPalette.solidImage(.white, size: size), redactions: [label],
                                    timestamp: Date())
@@ -112,6 +114,79 @@ final class MediaPainterFuzzTests: XCTestCase {
         // `.zero` paints only its 2pt padding at the origin; the middle must still be white.
         let middle = bitmap.pixel(bitmap.width / 2, bitmap.height / 2)
         XCTAssertGreaterThan(min(middle.r, middle.g, middle.b), 200, "hostile rects blacked out the frame: \(middle)")
+    }
+
+    // MARK: - Skeleton style
+
+    /// A text or sensitive mask takes every colour from outside itself, so two frames that
+    /// differ only inside the mask must encode to the same bytes.
+    func testSkeletonTextAndSensitiveMasksDoNotDependOnWhatTheyCover() throws {
+        for seed in PrivacyFuzzConfig.seeds(default: 24, slowDivisor: 4) {
+            var rng = PrivacyFuzzRNG(seed: seed)
+            let size = CGSize(width: rng.cgFloat(120...500), height: rng.cgFloat(120...900))
+            var options = ReplayOptions()
+            options.quality = rng.pick(ReplayQuality.allCases)
+            let rects = (0..<rng.int(1...6)).map { _ in
+                CGRect(x: rng.cgFloat(0...(size.width - 20)), y: rng.cgFloat(0...(size.height - 20)),
+                       width: rng.cgFloat(4...120), height: rng.cgFloat(4...90))
+            }
+            let kinds = rects.map { _ in rng.pick([MaskKind.text, .image, .unknown]) }
+            // Image masks may carry a muted tint of what they cover; make every non-text one sensitive.
+            let sensitive = zip(rects, kinds).filter { $0.1 != .text }.map(\.0)
+            let background = rng.pick(PrivacyFuzzPalette.safe)
+            func frame(covering fill: UIColor) throws -> Data {
+                let image = imageWithBlocks(size: size, background: background, blocks: rects, fill: fill)
+                let pending = PendingFrame(image: image, redactions: rects, kinds: kinds, timestamp: Date(), sensitive: sensitive)
+                let redacted = try XCTUnwrap(RedactionPainter.redact(pending, options: options))
+                let raw = try XCTUnwrap(redacted.dataProvider?.data as Data?)
+                // RGB only: the fourth byte of a skip-alpha bitmap is padding.
+                return Data(raw.enumerated().filter { $0.offset % 4 != 3 }.map(\.element))
+            }
+            let context = "\(PrivacyFuzzConfig.describe(seed)) size=\(size) rects=\(rects) kinds=\(kinds)"
+            // Raw pixels rather than JPEG bytes, so a failure points at the painter.
+            XCTAssertEqual(try frame(covering: PrivacyFuzzPalette.sentinel), try frame(covering: .black),
+                           "PRIVACY LEAK (skeleton): masked content changed the output. \(context)")
+        }
+    }
+
+    /// Whatever kind a mask is, the content under it never survives, image tints included.
+    func testSkeletonMasksLeaveNoSentinelPixels() throws {
+        var checked = 0
+        for seed in PrivacyFuzzConfig.seeds(default: 40, slowDivisor: 4) {
+            var rng = PrivacyFuzzRNG(seed: seed)
+            let size = randomSourceSize(&rng)
+            guard size.width >= 8, size.height >= 8, size.width < 3000, size.height < 3000 else { continue }
+            var options = ReplayOptions()
+            options.quality = rng.pick(ReplayQuality.allCases)
+            let rects = (0..<rng.int(1...10)).map { _ in randomRect(&rng, in: size) }
+                .filter(RedactionPainter.isFinite)
+                .map { $0.standardized.intersection(CGRect(origin: .zero, size: size)) }
+                .filter { !$0.isNull && $0.width >= 1 && $0.height >= 1 }
+            guard !rects.isEmpty else { continue }
+            let kinds = rects.map { _ in rng.pick([MaskKind.text, .image, .unknown]) }
+            let image = imageWithBlocks(size: size, background: rng.pick(PrivacyFuzzPalette.safe), blocks: rects,
+                                        fill: PrivacyFuzzPalette.sentinel)
+            let pending = PendingFrame(image: image, redactions: rects, kinds: kinds, timestamp: Date())
+            let frame = try XCTUnwrap(RedactionPainter.redactAndCompress(pending, options: options))
+            let leak = try XCTUnwrap(PrivacyFuzzBitmap(jpeg: frame.jpeg)).sentinelPixels()
+            checked += 1
+            XCTAssertEqual(leak.count, 0, "PRIVACY LEAK (skeleton): \(PrivacyFuzzConfig.describe(seed)) size=\(size) "
+                           + "rects=\(rects) kinds=\(kinds) first=\(leak.samples)")
+        }
+        XCTAssertGreaterThan(checked, 0, "no frame was checked")
+    }
+
+    private func imageWithBlocks(size: CGSize, background: UIColor, blocks: [CGRect], fill: UIColor) -> UIImage {
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        format.opaque = true
+        format.preferredRange = .standard // as ViewCapture captures
+        return UIGraphicsImageRenderer(size: size, format: format).image { context in
+            background.setFill()
+            context.fill(CGRect(origin: .zero, size: size))
+            fill.setFill()
+            for block in blocks { context.fill(block) }
+        }
     }
 
     // MARK: - Generators

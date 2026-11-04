@@ -9,6 +9,8 @@ import UIKit
 struct PendingFrame {
     let image: UIImage
     let redactions: [CGRect]
+    /// What each redaction covers, parallel to `redactions`. Missing entries are `.unknown`.
+    var kinds: [MaskKind] = []
     let timestamp: Date
     /// Forced masks only, in window points: where touches must not be recorded.
     var sensitive: [CGRect] = []
@@ -50,6 +52,10 @@ enum ViewCapture {
         // what made `high` indistinguishable from `medium` when this was pinned to 1.
         format.scale = options.quality.effectiveScale(forPointSize: bounds.size)
         format.opaque = true
+        // 8-bit sRGB, what the JPEG ends up as anyway. An extended-range capture is
+        // dithered down to 8 bits in the painter, and that dither spreads a trace of
+        // masked pixels into the rest of the frame.
+        format.preferredRange = .standard
 
         let renderer = UIGraphicsImageRenderer(bounds: bounds, format: format)
         var drew = false
@@ -88,7 +94,7 @@ enum ViewCapture {
         guard drew else { return nil }
 
         return PendingFrame(
-            image: image, redactions: scan.rects, timestamp: Date(), sensitive: scan.sensitive
+            image: image, redactions: scan.rects, kinds: scan.kinds, timestamp: Date(), sensitive: scan.sensitive
         )
     }
 

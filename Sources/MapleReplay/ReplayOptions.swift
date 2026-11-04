@@ -24,6 +24,15 @@ public enum FlushPolicy: Equatable, Sendable {
     public static let defaultBuffered = FlushPolicy.buffered(window: 30)
 }
 
+/// How a redacted region is painted. Both styles replace every pixel of the region.
+public enum ReplayMaskStyle: String, Sendable, CaseIterable {
+    /// A loading-skeleton look: the region takes the colour of the surface around it,
+    /// text becomes rounded bars and images a muted tint of their own average colour.
+    case skeleton
+    /// A flat black box. Reveals nothing about images, not even their tone.
+    case solid
+}
+
 /// Output resolution / compression tier. Mirrors Sentry's three-tier model.
 public enum ReplayQuality: String, Sendable, CaseIterable {
     case low, medium, high
@@ -172,6 +181,10 @@ public struct ReplayOptions: Sendable {
     /// unmasks `UILabel` and nothing else; it does not quietly expose every label
     /// subclass in the app. Name the class you mean.
     public var unmaskedViewClasses: [AnyClass] = []
+
+    /// How masked regions are painted. `.skeleton` keeps replays watchable; `.solid`
+    /// when even the muted tone of a masked image must not be recorded.
+    public var maskStyle: ReplayMaskStyle = .skeleton
 
     /// Draw the redaction rects on screen instead of only into captured frames.
     /// Debug affordance — see `MaskingPreviewView`.
