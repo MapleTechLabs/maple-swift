@@ -104,6 +104,10 @@ final class RecorderController: ObservableObject {
         if let images = ProcessInfo.processInfo.environment["MAPLE_MASK_ALL_IMAGES"] {
             options.maskAllImages = images != "0"
         }
+        //   MAPLE_MASK_STYLE=solid <run>   compares against flat black masks
+        if let style = ProcessInfo.processInfo.environment["MAPLE_MASK_STYLE"].flatMap(ReplayMaskStyle.init(rawValue:)) {
+            options.maskStyle = style
+        }
         return options
     }
 
