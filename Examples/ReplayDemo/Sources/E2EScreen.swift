@@ -31,6 +31,9 @@ enum E2EConfiguration {
         replay.backgroundSessionTimeout = double("MAPLE_BACKGROUND_TIMEOUT") ?? 30
         // Lets a run prove the masking assertions can fail.
         replay.maskAllText = environment["MAPLE_MASK_ALL_TEXT"] != "0"
+        if let style = environment["MAPLE_MASK_STYLE"].flatMap(ReplayMaskStyle.init(rawValue:)) {
+            replay.maskStyle = style
+        }
         options.replay = replay
         return options
     }
@@ -69,7 +72,7 @@ struct E2EScreen: View {
 
             VStack(spacing: 14) {
                 // No padding or background: the element's frame must be the glyphs' frame,
-                // which is what the masking scenario expects to find painted black.
+                // which is what the masking scenarios expect to find painted over.
                 Text("SECRET-4242-PII")
                     .font(.system(size: 28, weight: .bold))
                     .foregroundStyle(.black)
