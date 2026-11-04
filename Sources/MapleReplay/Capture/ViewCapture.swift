@@ -11,6 +11,8 @@ struct PendingFrame {
     let redactions: [CGRect]
     /// What each redaction covers, parallel to `redactions`. Missing entries are `.unknown`.
     var kinds: [MaskKind] = []
+    /// Redactions swallowed by larger ones, painted as shape hints only.
+    var inner: [InnerMask] = []
     let timestamp: Date
     /// Forced masks only, in window points: where touches must not be recorded.
     var sensitive: [CGRect] = []
@@ -94,7 +96,7 @@ enum ViewCapture {
         guard drew else { return nil }
 
         return PendingFrame(
-            image: image, redactions: scan.rects, kinds: scan.kinds, timestamp: Date(), sensitive: scan.sensitive
+            image: image, redactions: scan.rects, kinds: scan.kinds, inner: scan.inner, timestamp: Date(), sensitive: scan.sensitive
         )
     }
 

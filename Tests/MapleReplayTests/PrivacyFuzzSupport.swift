@@ -634,7 +634,7 @@ enum PrivacyFuzzWindow {
                 window.layer.render(in: context.cgContext)
             }
         }
-        return (PendingFrame(image: image, redactions: scan.rects, kinds: scan.kinds, timestamp: Date(), sensitive: scan.sensitive), path)
+        return (PendingFrame(image: image, redactions: scan.rects, kinds: scan.kinds, inner: scan.inner, timestamp: Date(), sensitive: scan.sensitive), path)
     }
 
     static func tearDown(_ window: UIWindow) {
