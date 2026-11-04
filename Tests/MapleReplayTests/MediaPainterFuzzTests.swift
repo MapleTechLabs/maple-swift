@@ -130,13 +130,14 @@ final class MediaPainterFuzzTests: XCTestCase {
                 CGRect(x: rng.cgFloat(0...(size.width - 20)), y: rng.cgFloat(0...(size.height - 20)),
                        width: rng.cgFloat(4...120), height: rng.cgFloat(4...90))
             }
-            let kinds = rects.map { _ in rng.pick([MaskKind.text, .image, .unknown]) }
+            let kinds = rects.map { _ in rng.pick([MaskKind.text, .image, .unknown, .cover]) }
+            let inner = Self.innerMasks(in: rects, &rng)
             // Image masks may carry a muted tint of what they cover; make every non-text one sensitive.
             let sensitive = zip(rects, kinds).filter { $0.1 != .text }.map(\.0)
             let background = rng.pick(PrivacyFuzzPalette.safe)
             func frame(covering fill: UIColor) throws -> Data {
                 let image = imageWithBlocks(size: size, background: background, blocks: rects, fill: fill)
-                let pending = PendingFrame(image: image, redactions: rects, kinds: kinds, timestamp: Date(), sensitive: sensitive)
+                let pending = PendingFrame(image: image, redactions: rects, kinds: kinds, inner: inner, timestamp: Date(), sensitive: sensitive)
                 let redacted = try XCTUnwrap(RedactionPainter.redact(pending, options: options))
                 let raw = try XCTUnwrap(redacted.dataProvider?.data as Data?)
                 // RGB only: the fourth byte of a skip-alpha bitmap is padding.
@@ -163,10 +164,11 @@ final class MediaPainterFuzzTests: XCTestCase {
                 .map { $0.standardized.intersection(CGRect(origin: .zero, size: size)) }
                 .filter { !$0.isNull && $0.width >= 1 && $0.height >= 1 }
             guard !rects.isEmpty else { continue }
-            let kinds = rects.map { _ in rng.pick([MaskKind.text, .image, .unknown]) }
+            let kinds = rects.map { _ in rng.pick([MaskKind.text, .image, .unknown, .cover]) }
+            let inner = Self.innerMasks(in: rects, &rng)
             let image = imageWithBlocks(size: size, background: rng.pick(PrivacyFuzzPalette.safe), blocks: rects,
                                         fill: PrivacyFuzzPalette.sentinel)
-            let pending = PendingFrame(image: image, redactions: rects, kinds: kinds, timestamp: Date())
+            let pending = PendingFrame(image: image, redactions: rects, kinds: kinds, inner: inner, timestamp: Date())
             let frame = try XCTUnwrap(RedactionPainter.redactAndCompress(pending, options: options))
             let leak = try XCTUnwrap(PrivacyFuzzBitmap(jpeg: frame.jpeg)).sentinelPixels()
             checked += 1
@@ -174,6 +176,20 @@ final class MediaPainterFuzzTests: XCTestCase {
                            + "rects=\(rects) kinds=\(kinds) first=\(leak.samples)")
         }
         XCTAssertGreaterThan(checked, 0, "no frame was checked")
+    }
+
+    /// A few smaller text or image masks inside random containers.
+    private static func innerMasks(in rects: [CGRect], _ rng: inout PrivacyFuzzRNG) -> [InnerMask] {
+        rects.indices.flatMap { index -> [InnerMask] in
+            let container = rects[index]
+            guard container.width > 8, container.height > 8, rng.chance(0.5) else { return [] }
+            return (0..<rng.int(1...3)).map { _ in
+                let width = rng.cgFloat(2...(container.width - 2)), height = rng.cgFloat(2...(container.height - 2))
+                let rect = CGRect(x: container.minX + rng.cgFloat(0...(container.width - width)),
+                                  y: container.minY + rng.cgFloat(0...(container.height - height)), width: width, height: height)
+                return InnerMask(rect: rect, kind: rng.pick([.text, .image]), container: index)
+            }
+        }
     }
 
     private func imageWithBlocks(size: CGSize, background: UIColor, blocks: [CGRect], fill: UIColor) -> UIImage {

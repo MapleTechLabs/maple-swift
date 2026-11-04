@@ -5,6 +5,18 @@ import UIKit
 /// Advisory only: it changes the look of a mask, never whether a region is masked.
 enum MaskKind: Sendable, Equatable {
     case text, image, unknown
+    /// Where a view is in the model tree but not on screen mid-animation: filled, but
+    /// no placeholder, so a moving view does not leave a ghost copy behind.
+    case cover
+}
+
+/// A redaction swallowed by a larger one. Painted as a shape only, so a big mask over
+/// a glass bar still shows where its labels are.
+struct InnerMask: Equatable {
+    var rect: CGRect
+    var kind: MaskKind
+    /// Index into `Result.rects` of the redaction that contains this one.
+    var container: Int
 }
 
 /// Walks the view hierarchy to locate regions that must be painted over before a frame
@@ -60,6 +72,8 @@ struct RedactionScanner {
         var rects: [CGRect]
         /// What each of `rects` covers, same order.
         var kinds: [MaskKind] = []
+        /// Text and image redactions inside another redaction, dropped from `rects`.
+        var inner: [InnerMask] = []
         /// The subset masked no matter what (typed input, explicit masks, always-masked
         /// classes), where a touch's position must not be recorded either.
         var sensitive: [CGRect]
@@ -90,11 +104,17 @@ struct RedactionScanner {
         )
         // Regions no view controller scoped are applied to the whole window.
         Self.applyUnmask(walk.unmaskRegions, to: &walk.redactions, from: 0)
-        let kept = merge(walk.redactions.map { ($0.rect, $0.kind) })
+        let (kept, dropped) = merge(walk.redactions.map { ($0.rect, $0.kind) })
+        let inner = dropped.compactMap { rect, kind -> InnerMask? in
+            guard kind == .text || kind == .image,
+                  let container = kept.firstIndex(where: { $0.0.contains(rect) }) else { return nil }
+            return InnerMask(rect: rect, kind: kind, container: container)
+        }
         return Result(
             rects: kept.map(\.0),
             kinds: kept.map(\.1),
-            sensitive: merge(walk.redactions.filter(\.forced).map { ($0.rect, MaskKind.unknown) }).map(\.0)
+            inner: inner,
+            sensitive: merge(walk.redactions.filter(\.forced).map { ($0.rect, MaskKind.unknown) }).kept.map(\.0)
         )
     }
 
@@ -133,7 +153,7 @@ struct RedactionScanner {
         // accounts for every rect the real scan produces.
         let subtreeClip = view.clipsToBounds ? visible : clip
         let owner = NSStringFromClass(type(of: view))
-        for rect in contentLayerRects(of: view, root: root, clip: subtreeClip) {
+        for (rect, _) in contentLayerRects(of: view, root: root, clip: subtreeClip) {
             result.append(("\(owner)→layer", rect))
         }
         for subview in view.subviews {
@@ -190,7 +210,8 @@ struct RedactionScanner {
         func add(forced: Bool, extra: [CGRect] = []) {
             let kind = Self.kind(of: view)
             for rect in ownRects + extra {
-                walk.redactions.append(Redaction(rect: rect, forced: forced, kind: kind))
+                let ghost = rect == modelRect && Self.isGhost(model: modelRect, presented: presentationRect)
+                walk.redactions.append(Redaction(rect: rect, forced: forced, kind: ghost ? .cover : kind))
             }
         }
         func descend(_ rules: Rules) {
@@ -202,8 +223,8 @@ struct RedactionScanner {
             add(forced: forced, extra: overflowRects(of: view, root: root, clip: clip))
             guard !view.clipsToBounds else { return }
             // Drawing layers can sit outside a non-clipping view's bounds too.
-            for rect in contentLayerRects(of: view, root: root, clip: clip, animating: animating) {
-                walk.redactions.append(Redaction(rect: rect, forced: forced))
+            for (rect, kind) in contentLayerRects(of: view, root: root, clip: clip, animating: animating) {
+                walk.redactions.append(Redaction(rect: rect, forced: forced, kind: kind))
             }
             descend(.inherited(forced: forced))
         }
@@ -281,8 +302,8 @@ struct RedactionScanner {
         // `maskAllImages`, which only reaches `UIImageView`.
         if options.maskAllText {
             let subtreeClip = view.clipsToBounds ? (modelRect ?? clip) : clip
-            for rect in contentLayerRects(of: view, root: root, clip: subtreeClip, animating: animating) {
-                walk.redactions.append(Redaction(rect: rect, forced: false))
+            for (rect, kind) in contentLayerRects(of: view, root: root, clip: subtreeClip, animating: animating) {
+                walk.redactions.append(Redaction(rect: rect, forced: false, kind: kind))
             }
         }
 
@@ -426,14 +447,14 @@ struct RedactionScanner {
     /// the full masking rules to them. Only layers with no owning view are handled here.
     private func contentLayerRects(
         of view: UIView, root: UIView, clip: CGRect, animating: Bool = false
-    ) -> [CGRect] {
+    ) -> [(CGRect, MaskKind)] {
         guard let sublayers = view.layer.sublayers, !sublayers.isEmpty else { return [] }
         // Subviews' layers are sublayers of their superview's layer. Skip them at any
         // depth — the view walk reaches them and can apply the full masking rules;
         // handling them here too would double-count and bypass those rules.
         let subviewLayers = Set(view.subviews.map { ObjectIdentifier($0.layer) })
 
-        var result: [CGRect] = []
+        var result: [(CGRect, MaskKind)] = []
         for layer in sublayers {
             collectContentLayers(
                 layer, root: root, skipping: subviewLayers, clip: clip,
@@ -449,7 +470,7 @@ struct RedactionScanner {
         skipping subviewLayers: Set<ObjectIdentifier>,
         clip: CGRect,
         animating: Bool = false,
-        into result: inout [CGRect]
+        into result: inout [(CGRect, MaskKind)]
     ) {
         guard !subviewLayers.contains(ObjectIdentifier(layer)) else { return }
         guard !layer.isHidden, layer.opacity > 0.01 else { return }
@@ -481,8 +502,10 @@ struct RedactionScanner {
         }
 
         guard isContentBearing(layer) else { return }
-        if let visible = clipped(bounds, to: clip) { result.append(visible) }
-        if animating, let presented = presentationRect(of: layer, in: root) { result.append(presented) }
+        let visible = clipped(bounds, to: clip)
+        let presented = animating ? presentationRect(of: layer, in: root) : nil
+        if let visible { result.append((visible, Self.isGhost(model: visible, presented: presented) ? .cover : .unknown)) }
+        if let presented { result.append((presented, .unknown)) }
     }
 
     /// Layer classes that render only decoration, never information.
@@ -631,15 +654,27 @@ struct RedactionScanner {
     /// column of slightly-overlapping rows collapses into one full-screen mask. That was
     /// observed here — 100% coverage from a single rect. Containment can only ever
     /// shrink the set, so it cannot run away.
-    private func merge(_ rects: [(CGRect, MaskKind)]) -> [(CGRect, MaskKind)] {
-        guard rects.count > 1 else { return rects }
+    private func merge(_ rects: [(CGRect, MaskKind)]) -> (kept: [(CGRect, MaskKind)], dropped: [(CGRect, MaskKind)]) {
+        guard rects.count > 1 else { return (rects, []) }
         // Largest first, so a container is seen before the rects it swallows.
         let sorted = rects.sorted { $0.0.width * $0.0.height > $1.0.width * $1.0.height }
         var kept: [(CGRect, MaskKind)] = []
-        for entry in sorted where !kept.contains(where: { $0.0.contains(entry.0) }) {
-            kept.append(entry)
+        var dropped: [(CGRect, MaskKind)] = []
+        for entry in sorted {
+            if kept.contains(where: { $0.0.contains(entry.0) }) {
+                dropped.append(entry)
+            } else {
+                kept.append(entry)
+            }
         }
-        return kept
+        return (kept, dropped)
+    }
+
+    /// The model rect of a view whose on-screen (presentation) rect is somewhere else.
+    private static func isGhost(model: CGRect?, presented: CGRect?) -> Bool {
+        guard let model, let presented else { return false }
+        return abs(model.minX - presented.minX) > 1 || abs(model.minY - presented.minY) > 1
+            || abs(model.width - presented.width) > 1 || abs(model.height - presented.height) > 1
     }
 
     /// The placeholder shape for a masked view. Text inputs read as text, never image.

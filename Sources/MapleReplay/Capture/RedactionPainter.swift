@@ -51,6 +51,7 @@ enum RedactionPainter {
         let sourceBounds = CGRect(origin: .zero, size: source.size)
         let outputBounds = CGRect(origin: .zero, size: targetSize)
         var regions: [Region] = []
+        var regionOfRedaction: [Int: Int] = [:]
         for (index, redaction) in pending.redactions.enumerated() where Self.isFinite(redaction) {
             // Trimmed to the frame before scaling: a huge but finite rect overflows to
             // infinity when scaled, and an infinite rect fills nothing.
@@ -60,7 +61,17 @@ enum RedactionPainter {
             let fill = scaled.insetBy(dx: -padding, dy: -padding).integral
             let sensitive = pending.sensitive.contains { Self.isFinite($0) && $0.intersects(rect) }
             let kind = index < pending.kinds.count ? pending.kinds[index] : .unknown
+            regionOfRedaction[index] = regions.count
             regions.append(Region(content: scaled.intersection(outputBounds), fill: fill, kind: kind, sensitive: sensitive))
+        }
+        for inner in pending.inner where Self.isFinite(inner.rect) {
+            guard let regionIndex = regionOfRedaction[inner.container] else { continue }
+            let rect = inner.rect.standardized.intersection(sourceBounds)
+            guard !rect.isNull, !rect.isEmpty else { continue }
+            let scaled = rect.applying(CGAffineTransform(scaleX: scaleX, y: scaleY))
+                .intersection(regions[regionIndex].content)
+            guard !scaled.isNull, !scaled.isEmpty else { continue }
+            regions[regionIndex].inner.append((scaled, inner.kind))
         }
 
         guard let canvas = Canvas(size: targetSize) else { return nil }
@@ -89,6 +100,8 @@ enum RedactionPainter {
         var kind: MaskKind
         /// Overlaps typed input or an explicit mask: nothing inside it may tint the fill.
         var sensitive: Bool
+        /// Smaller masks inside this one, in output pixels: drawn as shapes on top.
+        var inner: [(CGRect, MaskKind)] = []
     }
 
     /// Paint every region as a skeleton placeholder.
@@ -115,6 +128,8 @@ enum RedactionPainter {
         }
         for (region, plan) in zip(regions, plans) {
             switch plan.shape {
+            case .none:
+                break
             case .bars(let color):
                 context.setFillColor(color.cgColor)
                 for bar in textBars(in: region.content, pointScale: pointScale) {
@@ -130,24 +145,50 @@ enum RedactionPainter {
                 context.addPath(CGPath(roundedRect: rect, cornerWidth: radius, cornerHeight: radius, transform: nil))
                 context.fillPath()
             }
+            // Geometry only, and never inside an explicit or typed-input mask, whose
+            // owner asked for the whole area to read as one block.
+            guard !region.sensitive, !region.inner.isEmpty else { continue }
+            let tone = plan.shape.base(on: plan.surface).placeholderTone
+            context.setFillColor(tone.cgColor)
+            for (rect, kind) in region.inner {
+                let shapes = kind == .text ? textBars(in: rect, pointScale: pointScale) : [rect]
+                for shape in shapes {
+                    let radius = kind == .text ? min(shape.height, shape.width) / 2 : min(6 * pointScale, min(shape.width, shape.height) * 0.2)
+                    context.addPath(CGPath(roundedRect: shape, cornerWidth: radius, cornerHeight: radius, transform: nil))
+                    context.fillPath()
+                }
+            }
         }
     }
 
     enum Shape {
+        case none
         case bars(RGB)
         case block(RGB)
+
+        /// The colour an inner shape is drawn against.
+        func base(on surface: RGB) -> RGB {
+            if case .block(let color) = self { return color }
+            return surface
+        }
     }
 
     static func shape(for region: Region, surface: RGB, canvas: Canvas, pointScale: CGFloat) -> Shape {
         let rect = region.content
+        if region.kind == .cover { return .none }
         let lineLike = rect.height <= 40 * pointScale && rect.width >= rect.height * 1.2
         let isText = region.kind == .text || (region.kind == .unknown && lineLike)
         if isText { return .bars(surface.placeholderTone) }
         // A sensitive region reads only from outside itself, whatever it holds.
-        guard !region.sensitive, let average = canvas.averageColor(in: rect) else {
+        guard !region.sensitive, let sample = canvas.sampleInside(rect, surface: surface) else {
             return .block(surface.placeholderTone)
         }
-        return .block(average.muted(toward: surface))
+        // Mostly bare surface with a little ink, and no inner masks to show instead:
+        // wrapped text drawn by a view we cannot identify, like SwiftUI's.
+        if region.kind == .unknown, region.inner.isEmpty, sample.surfaceShare >= 0.6 {
+            return .bars(surface.placeholderTone)
+        }
+        return .block(sample.average.muted(toward: surface))
     }
 
     /// Rounded bars standing in for lines of text: one per ~22 pt of height, each about
@@ -200,50 +241,62 @@ enum RedactionPainter {
 
         /// Per-channel median of a band of pixels just outside `rect`, skipping pixels
         /// inside any other region. Median, so text or an icon crossing the band does not
-        /// tint the result.
+        /// tint the result. Reads at most ~256 pixels, spread evenly over the band.
         func medianColor(around rect: CGRect, excluding others: [CGRect], skipping index: Int, pointScale: CGFloat) -> RGB {
-            let band = max(2, Int((3 * pointScale).rounded()))
-            let outer = rect.insetBy(dx: CGFloat(-band), dy: CGFloat(-band))
-            let minX = Int(outer.minX), maxX = Int(outer.maxX), minY = Int(outer.minY), maxY = Int(outer.maxY)
-            let perimeter = max(1, 2 * (maxX - minX + maxY - minY))
-            let stride = max(1, perimeter * band / 600)
-            var histograms = [[Int]](repeating: [Int](repeating: 0, count: 256), count: 3)
-            var count = 0
-            var step = 0
-            for y in minY..<max(minY, maxY) {
-                for x in minX..<max(minX, maxX) {
-                    let point = CGPoint(x: CGFloat(x) + 0.5, y: CGFloat(y) + 0.5)
-                    guard !rect.contains(point) else { continue }
-                    step += 1
-                    guard step % stride == 0 else { continue }
-                    let excluded = others.indices.contains { $0 != index && others[$0].contains(point) }
-                    guard !excluded, let p = pixel(x, y) else { continue }
-                    histograms[0][Int(p.r * 255)] += 1
-                    histograms[1][Int(p.g * 255)] += 1
-                    histograms[2][Int(p.b * 255)] += 1
-                    count += 1
+            let band = CGFloat(max(2, Int((3 * pointScale).rounded())))
+            let outer = rect.insetBy(dx: -band, dy: -band)
+            // Only neighbours that reach the band can hide a pixel of it.
+            let nearby = others.indices.filter { $0 != index && others[$0].intersects(outer) }.map { others[$0] }
+            let strips = [
+                CGRect(x: outer.minX, y: outer.minY, width: outer.width, height: band),
+                CGRect(x: outer.minX, y: rect.maxY, width: outer.width, height: band),
+                CGRect(x: outer.minX, y: rect.minY, width: band, height: rect.height),
+                CGRect(x: rect.maxX, y: rect.minY, width: band, height: rect.height),
+            ].map { $0.intersection(CGRect(x: 0, y: 0, width: width, height: height)) }
+                .filter { !$0.isNull && $0.width >= 1 && $0.height >= 1 }
+            let area = strips.reduce(0) { $0 + $1.width * $1.height }
+            guard area > 0 else { return Self.fallbackSurface }
+            // One sample per `step` x `step` cell keeps the count near the budget.
+            let step = max(1, (area / 256).squareRoot())
+            var reds: [UInt8] = [], greens: [UInt8] = [], blues: [UInt8] = []
+            reds.reserveCapacity(320); greens.reserveCapacity(320); blues.reserveCapacity(320)
+            for strip in strips {
+                var y = strip.minY + min(step, strip.height) / 2
+                while y < strip.maxY {
+                    var x = strip.minX + min(step, strip.width) / 2
+                    while x < strip.maxX {
+                        let point = CGPoint(x: x, y: y)
+                        if !nearby.contains(where: { $0.contains(point) }), let p = rawPixel(Int(x), Int(y)) {
+                            reds.append(p.0); greens.append(p.1); blues.append(p.2)
+                        }
+                        x += step
+                    }
+                    y += step
                 }
             }
             // Nothing visible around it: every neighbour is another mask or off frame.
-            guard count > 0 else { return RGB(r: 0.86, g: 0.86, b: 0.88) }
-            func median(_ histogram: [Int]) -> Double {
-                var seen = 0
-                for (value, n) in histogram.enumerated() {
-                    seen += n
-                    if seen * 2 >= count { return Double(value) / 255 }
-                }
-                return 1
-            }
-            return RGB(r: median(histograms[0]), g: median(histograms[1]), b: median(histograms[2]))
+            guard !reds.isEmpty else { return Self.fallbackSurface }
+            func median(_ values: [UInt8]) -> Double { Double(values.sorted()[values.count / 2]) / 255 }
+            return RGB(r: median(reds), g: median(greens), b: median(blues))
         }
 
-        /// Mean colour of up to ~24x24 evenly spaced samples inside `rect`.
-        func averageColor(in rect: CGRect) -> RGB? {
+        static let fallbackSurface = RGB(r: 0.86, g: 0.86, b: 0.88)
+
+        private func rawPixel(_ x: Int, _ y: Int) -> (UInt8, UInt8, UInt8)? {
+            guard x >= 0, y >= 0, x < width, y < height, let data = context.data else { return nil }
+            let p = data.assumingMemoryBound(to: UInt8.self) + y * context.bytesPerRow + x * 4
+            return (p[0], p[1], p[2])
+        }
+
+        /// Mean colour of up to ~24x24 evenly spaced samples inside `rect`, and the share of
+        /// them within a small distance of `surface`.
+        func sampleInside(_ rect: CGRect, surface: RGB) -> (average: RGB, surfaceShare: Double)? {
             let clipped = rect.intersection(CGRect(x: 0, y: 0, width: width, height: height))
             guard !clipped.isNull, clipped.width >= 1, clipped.height >= 1 else { return nil }
             let columns = min(24, Int(clipped.width)), rows = min(24, Int(clipped.height))
             var sum = RGB(r: 0, g: 0, b: 0)
             var count = 0
+            var onSurface = 0
             for row in 0..<rows {
                 for column in 0..<columns {
                     let x = Int(clipped.minX + (CGFloat(column) + 0.5) * clipped.width / CGFloat(columns))
@@ -251,10 +304,12 @@ enum RedactionPainter {
                     guard let p = pixel(x, y) else { continue }
                     sum = RGB(r: sum.r + p.r, g: sum.g + p.g, b: sum.b + p.b)
                     count += 1
+                    if abs(p.r - surface.r) + abs(p.g - surface.g) + abs(p.b - surface.b) < 0.12 { onSurface += 1 }
                 }
             }
             guard count > 0 else { return nil }
-            return RGB(r: sum.r / Double(count), g: sum.g / Double(count), b: sum.b / Double(count))
+            let average = RGB(r: sum.r / Double(count), g: sum.g / Double(count), b: sum.b / Double(count))
+            return (average, Double(onSurface) / Double(count))
         }
     }
 
