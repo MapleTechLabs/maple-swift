@@ -109,7 +109,10 @@ final class MediaPainterFuzzTests: XCTestCase {
         ]
         let pending = PendingFrame(image: PrivacyFuzzPalette.solidImage(.white, size: size), redactions: hostile,
                                    timestamp: Date())
-        let frame = try XCTUnwrap(RedactionPainter.redactAndCompress(pending, options: ReplayOptions()))
+        // Solid, so a hostile rect that reached the frame would blacken the white middle.
+        var options = ReplayOptions()
+        options.maskStyle = .solid
+        let frame = try XCTUnwrap(RedactionPainter.redactAndCompress(pending, options: options))
         let bitmap = try XCTUnwrap(PrivacyFuzzBitmap(jpeg: frame.jpeg))
         // `.zero` paints only its 2pt padding at the origin; the middle must still be white.
         let middle = bitmap.pixel(bitmap.width / 2, bitmap.height / 2)
@@ -132,8 +135,8 @@ final class MediaPainterFuzzTests: XCTestCase {
             }
             let kinds = rects.map { _ in rng.pick([MaskKind.text, .image, .unknown, .cover]) }
             let inner = Self.innerMasks(in: rects, &rng)
-            // Image masks may carry a muted tint of what they cover; make every non-text one sensitive.
-            let sensitive = zip(rects, kinds).filter { $0.1 != .text }.map(\.0)
+            // Only image masks may carry a muted tint of what they cover; make those sensitive.
+            let sensitive = zip(rects, kinds).filter { $0.1 == .image }.map(\.0)
             let background = rng.pick(PrivacyFuzzPalette.safe)
             func frame(covering fill: UIColor) throws -> Data {
                 let image = imageWithBlocks(size: size, background: background, blocks: rects, fill: fill)

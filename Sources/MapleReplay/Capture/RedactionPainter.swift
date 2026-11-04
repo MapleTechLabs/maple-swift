@@ -110,7 +110,8 @@ enum RedactionPainter {
     /// opaque with a colour sampled from *outside* it, then a shape is drawn on top. The
     /// only colour ever taken from inside a region is the average of a non-sensitive
     /// image, and that is desaturated and blended toward the surface before use, so it
-    /// keeps the image's rough tone and nothing else.
+    /// keeps the image's rough tone and nothing else. A non-sensitive unknown region is
+    /// also read to choose between bars and a block, never for a colour.
     ///
     /// Every colour is computed before anything is painted, so no region samples another
     /// region's mask, and ring pixels that fall inside any other region are skipped, so
@@ -184,10 +185,13 @@ enum RedactionPainter {
             return .block(surface.placeholderTone)
         }
         // Mostly bare surface with a little ink, and no inner masks to show instead:
-        // wrapped text drawn by a view we cannot identify, like SwiftUI's.
+        // wrapped text drawn by a view we cannot identify, like SwiftUI's. This picks
+        // the shape only; no colour from inside an unknown region reaches the frame,
+        // since its mean would vary with how much text it holds.
         if region.kind == .unknown, region.inner.isEmpty, sample.surfaceShare >= 0.6 {
             return .bars(surface.placeholderTone)
         }
+        guard region.kind == .image else { return .block(surface.placeholderTone) }
         return .block(sample.average.muted(toward: surface))
     }
 
